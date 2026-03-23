@@ -4,9 +4,9 @@
 //! and the core handshake state machine — all framework-agnostic.
 
 use async_trait::async_trait;
-use bsv_sdk::wallet::{ProtoWallet, CreateSignatureArgs, VerifySignatureArgs, Protocol, SecurityLevel, Counterparty};
-use bsv_sdk::auth::AuthMessage;
-use bsv_sdk::PublicKey;
+use bsv_rs::wallet::{ProtoWallet, CreateSignatureArgs, VerifySignatureArgs, Protocol, SecurityLevel, Counterparty};
+use bsv_rs::auth::AuthMessage;
+use bsv_rs::PublicKey;
 
 use crate::error::Result;
 use crate::types::StoredSession;

@@ -4,7 +4,7 @@
 //! payment header constants, and payment parsing — all framework-agnostic.
 
 use async_trait::async_trait;
-use bsv_sdk::wallet::{ProtoWallet, CreateHmacArgs, Protocol, SecurityLevel};
+use bsv_rs::wallet::{ProtoWallet, CreateHmacArgs, Protocol, SecurityLevel};
 
 use crate::error::{AuthError, Result};
 use crate::types::{BsvPayment, StoredPayment};

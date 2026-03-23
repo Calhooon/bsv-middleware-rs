@@ -80,8 +80,8 @@ pub enum AuthError {
     SerializationError(String),
 }
 
-impl From<bsv_sdk::Error> for AuthError {
-    fn from(e: bsv_sdk::Error) -> Self {
+impl From<bsv_rs::Error> for AuthError {
+    fn from(e: bsv_rs::Error) -> Self {
         AuthError::SdkError(e.to_string())
     }
 }

@@ -12,7 +12,7 @@ categories = ["authentication", "cryptography", "web-programming"]
 
 [dependencies]
 # BSV SDK - provides auth protocol, wallet, key derivation
-bsv_sdk = { version = "0.2", package = "bsv-rs", features = ["auth", "wallet", "transaction"] }
+bsv-rs = { version = "0.3", features = ["auth", "wallet", "transaction"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
