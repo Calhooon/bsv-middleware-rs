@@ -3,3 +3,10 @@ Cargo.lock
 *.swp
 *.swo
 .DS_Store
+.env
+.env.*
+.dev.vars
+*.pem
+*.key
+*.db
+*.sqlite
