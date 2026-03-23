@@ -1,0 +1,39 @@
+[package]
+name = "bsv-middleware-rs"
+version = "0.1.0"
+edition = "2021"
+authors = ["John Calhoun <dev@calhounjohn.com>"]
+description = "Framework-agnostic BRC-31 authentication and BRC-29 payment middleware for BSV"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Calhooon/bsv-middleware-rs"
+homepage = "https://github.com/Calhooon/bsv-middleware-rs"
+keywords = ["bitcoin", "bsv", "authentication", "middleware", "micropayments"]
+categories = ["authentication", "cryptography", "web-programming"]
+
+[dependencies]
+# BSV SDK - provides auth protocol, wallet, key derivation
+bsv_sdk = { version = "0.2", package = "bsv-rs", features = ["auth", "wallet", "transaction"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+thiserror = "1.0"
+
+# Encoding
+hex = "0.4"
+base64 = "0.22"
+
+# Hashing (for nonce HMAC, payload building)
+sha2 = "0.10"
+ripemd = "0.1"
+
+# Random bytes for nonce generation
+getrandom = "0.2"
+
+# Async traits
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
