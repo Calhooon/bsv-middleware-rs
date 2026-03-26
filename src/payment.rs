@@ -67,7 +67,7 @@ pub fn create_derivation_prefix(wallet: &ProtoWallet) -> Result<String> {
 
     // Generate 16 random bytes
     let mut random_bytes = [0u8; 16];
-    getrandom::getrandom(&mut random_bytes)
+    getrandom::fill(&mut random_bytes)
         .map_err(|e| AuthError::SdkError(format!("RNG error: {}", e)))?;
 
     // HMAC the random bytes using a derived key

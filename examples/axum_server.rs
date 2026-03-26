@@ -368,7 +368,7 @@ fn signed_response(
     let server_key = wallet.identity_key();
     let mut msg = AuthMessage::new(MessageType::General, server_key.clone());
     let mut rng = [0u8; 32];
-    getrandom::getrandom(&mut rng).unwrap();
+    getrandom::fill(&mut rng).unwrap();
     msg.nonce = Some(B64.encode(rng));
     msg.your_nonce = session.peer_nonce.clone();
     msg.payload = Some(payload);
