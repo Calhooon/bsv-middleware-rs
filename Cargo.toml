@@ -1,6 +1,6 @@
 [package]
 name = "bsv-middleware-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["John Calhoun <dev@calhounjohn.com>"]
 description = "Framework-agnostic BRC-31 authentication and BRC-29 payment middleware for BSV"
