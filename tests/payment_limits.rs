@@ -1,9 +1,14 @@
 //! Small boundary witnesses for the shared payment door (P0-5d, issue #57).
 //! No exhaustion shapes: at most 129 transactions or 33 single-leaf BUMPs.
+//!
+//! Since 0.3.0 the door answers in the six words: a refusal by a limit is
+//! `Unverifiable` with the reason naming the count and the bound, before the
+//! parse; the output-only check is used so no header service is in play.
 
 use bsv_middleware_rs::{
-    verify_payment_output, verify_payment_output_with_limits, PaymentOutputError,
-    MAX_PAYMENT_BEEF_BUMPS, MAX_PAYMENT_BEEF_TXS, MAX_PAYMENT_BYTES, PAYMENT_BEEF_LIMITS,
+    verify_payment_output_only, verify_payment_output_only_with_limits, PaymentToVerify,
+    PaymentVerdict, UnverifiableReason, MAX_PAYMENT_BEEF_BUMPS, MAX_PAYMENT_BEEF_TXS,
+    MAX_PAYMENT_BYTES, PAYMENT_BEEF_LIMITS,
 };
 use bsv_rs::script::{LockingScript, UnlockingScript};
 use bsv_rs::transaction::{
@@ -11,6 +16,36 @@ use bsv_rs::transaction::{
 };
 const SCRIPT: &[u8] = &[0x51];
 const PRICE: u64 = 100;
+const PAID: PaymentVerdict = PaymentVerdict::Verified { satoshis: PRICE };
+
+fn payment(transaction: &[u8]) -> PaymentToVerify<'_> {
+    PaymentToVerify {
+        transaction,
+        output_index: 0,
+        expected_script: SCRIPT,
+        required_satoshis: PRICE,
+    }
+}
+
+fn check(transaction: &[u8]) -> PaymentVerdict {
+    verify_payment_output_only(&payment(transaction))
+}
+
+fn check_with(transaction: &[u8], max_bytes: usize, limits: &BeefLimits) -> PaymentVerdict {
+    verify_payment_output_only_with_limits(&payment(transaction), max_bytes, limits)
+}
+
+fn refused(reason: UnverifiableReason) -> PaymentVerdict {
+    PaymentVerdict::Unverifiable(reason)
+}
+
+/// The reason of a refusal, as text; panics on any other word.
+fn reason(verdict: PaymentVerdict, what: &str) -> UnverifiableReason {
+    match verdict {
+        PaymentVerdict::Unverifiable(reason) => reason,
+        other => panic!("{what}: expected Unverifiable, got {other:?}"),
+    }
+}
 
 fn small_transaction(source: String, nonce: u32) -> Transaction {
     let mut tx = Transaction::new();
@@ -79,7 +114,7 @@ fn malformed_atomic(length: usize) -> Vec<u8> {
 #[test]
 fn one_byte_over_is_refused_before_atomic_parsing() {
     let bytes = malformed_atomic(MAX_PAYMENT_BYTES + 1);
-    let error = verify_payment_output(&bytes, 0, SCRIPT, PRICE).expect_err("over byte bound");
+    let error = reason(check(&bytes), "over byte bound");
     let message = error.to_string();
     assert!(message.contains("4194305"), "names the length: {message}");
     assert!(
@@ -91,7 +126,7 @@ fn one_byte_over_is_refused_before_atomic_parsing() {
 #[test]
 fn one_byte_over_is_refused_before_raw_parsing() {
     let bytes = vec![0; MAX_PAYMENT_BYTES + 1];
-    let error = verify_payment_output(&bytes, 0, SCRIPT, PRICE).expect_err("over byte bound");
+    let error = reason(check(&bytes), "over byte bound");
     let message = error.to_string();
     assert!(message.contains("4194305"), "names the length: {message}");
     assert!(
@@ -103,21 +138,21 @@ fn one_byte_over_is_refused_before_raw_parsing() {
 #[test]
 fn exactly_the_byte_bound_reaches_the_parser() {
     let bytes = malformed_atomic(MAX_PAYMENT_BYTES);
-    let error = verify_payment_output(&bytes, 0, SCRIPT, PRICE).expect_err("invalid inner version");
-    assert!(matches!(error, PaymentOutputError::MalformedTransaction(_)));
+    let error = reason(check(&bytes), "invalid inner version");
+    assert!(matches!(error, UnverifiableReason::MalformedTransaction(_)));
     assert!(error.to_string().contains("Invalid BEEF version"));
 }
 
 #[test]
 fn exactly_the_transaction_bound_is_admitted() {
     let bytes = chain_atomic(MAX_PAYMENT_BEEF_TXS);
-    assert_eq!(verify_payment_output(&bytes, 0, SCRIPT, PRICE), Ok(PRICE));
+    assert_eq!(check(&bytes), PAID);
 }
 
 #[test]
 fn one_transaction_over_is_refused_with_the_count_and_bound() {
     let bytes = chain_atomic(MAX_PAYMENT_BEEF_TXS + 1);
-    let error = verify_payment_output(&bytes, 0, SCRIPT, PRICE).expect_err("129 transactions");
+    let error = reason(check(&bytes), "129 transactions");
     let message = error.to_string();
     assert!(
         message.contains("129 transactions"),
@@ -132,13 +167,13 @@ fn one_transaction_over_is_refused_with_the_count_and_bound() {
 #[test]
 fn exactly_the_bump_bound_is_admitted() {
     let bytes = funded_atomic(MAX_PAYMENT_BEEF_BUMPS);
-    assert_eq!(verify_payment_output(&bytes, 0, SCRIPT, PRICE), Ok(PRICE));
+    assert_eq!(check(&bytes), PAID);
 }
 
 #[test]
 fn one_bump_over_is_refused_with_the_count_and_bound() {
     let bytes = funded_atomic(MAX_PAYMENT_BEEF_BUMPS + 1);
-    let error = verify_payment_output(&bytes, 0, SCRIPT, PRICE).expect_err("33 BUMPs");
+    let error = reason(check(&bytes), "33 BUMPs");
     let message = error.to_string();
     assert!(message.contains("33 BUMPs"), "names the count: {message}");
     assert!(
@@ -151,8 +186,8 @@ fn one_bump_over_is_refused_with_the_count_and_bound() {
 fn custom_byte_budget_is_checked_before_parsing_either_format() {
     for bytes in [vec![0; 41], malformed_atomic(41)] {
         assert_eq!(
-            verify_payment_output_with_limits(&bytes, 0, SCRIPT, PRICE, 40, &PAYMENT_BEEF_LIMITS),
-            Err(PaymentOutputError::PaymentTooLarge {
+            check_with(&bytes, 40, &PAYMENT_BEEF_LIMITS),
+            refused(UnverifiableReason::PaymentTooLarge {
                 bytes: 41,
                 max_bytes: 40,
             })
@@ -168,8 +203,8 @@ fn custom_beef_byte_budget_can_be_smaller_than_the_outer_budget() {
         ..PAYMENT_BEEF_LIMITS
     };
     assert_eq!(
-        verify_payment_output_with_limits(&bytes, 0, SCRIPT, PRICE, 41, &limits),
-        Err(PaymentOutputError::PaymentTooLarge {
+        check_with(&bytes, 41, &limits),
+        refused(UnverifiableReason::PaymentTooLarge {
             bytes: 41,
             max_bytes: 40
         })
@@ -184,27 +219,21 @@ fn custom_beef_counts_admit_at_the_bound_and_refuse_one_over() {
         max_bytes: MAX_PAYMENT_BYTES,
     };
     let at_bound = chain_atomic(4);
-    assert_eq!(
-        verify_payment_output_with_limits(&at_bound, 0, SCRIPT, PRICE, at_bound.len(), &limits),
-        Ok(PRICE)
-    );
+    assert_eq!(check_with(&at_bound, at_bound.len(), &limits), PAID);
     let one_over = chain_atomic(5);
     assert_eq!(
-        verify_payment_output_with_limits(&one_over, 0, SCRIPT, PRICE, one_over.len(), &limits),
-        Err(PaymentOutputError::BeefTransactionsExceeded {
+        check_with(&one_over, one_over.len(), &limits),
+        refused(UnverifiableReason::BeefTransactionsExceeded {
             count: 5,
             max_txs: 4
         })
     );
     let at_bound = funded_atomic(2);
-    assert_eq!(
-        verify_payment_output_with_limits(&at_bound, 0, SCRIPT, PRICE, at_bound.len(), &limits),
-        Ok(PRICE)
-    );
+    assert_eq!(check_with(&at_bound, at_bound.len(), &limits), PAID);
     let one_over = funded_atomic(3);
     assert_eq!(
-        verify_payment_output_with_limits(&one_over, 0, SCRIPT, PRICE, one_over.len(), &limits),
-        Err(PaymentOutputError::BeefBumpsExceeded {
+        check_with(&one_over, one_over.len(), &limits),
+        refused(UnverifiableReason::BeefBumpsExceeded {
             count: 3,
             max_bumps: 2
         })
@@ -222,10 +251,7 @@ fn a_caller_can_admit_counts_above_the_default_budgets() {
         chain_atomic(limits.max_txs),
         funded_atomic(limits.max_bumps),
     ] {
-        assert_eq!(
-            verify_payment_output_with_limits(&bytes, 0, SCRIPT, PRICE, bytes.len(), &limits),
-            Ok(PRICE)
-        );
+        assert_eq!(check_with(&bytes, bytes.len(), &limits), PAID);
     }
 }
 
@@ -237,13 +263,10 @@ fn raw_transactions_ignore_beef_budgets_and_admit_the_exact_byte_budget() {
         max_bumps: 0,
         max_bytes: 0,
     };
+    assert_eq!(check_with(&raw, raw.len(), &limits), PAID);
     assert_eq!(
-        verify_payment_output_with_limits(&raw, 0, SCRIPT, PRICE, raw.len(), &limits),
-        Ok(PRICE)
-    );
-    assert_eq!(
-        verify_payment_output_with_limits(&raw, 0, SCRIPT, PRICE, raw.len() - 1, &limits),
-        Err(PaymentOutputError::PaymentTooLarge {
+        check_with(&raw, raw.len() - 1, &limits),
+        refused(UnverifiableReason::PaymentTooLarge {
             bytes: raw.len(),
             max_bytes: raw.len() - 1
         })
@@ -270,7 +293,7 @@ fn the_declared_atomic_subject_is_used_even_when_it_is_not_last() {
             .txid(),
         subject
     );
-    assert_eq!(verify_payment_output(&bytes, 0, SCRIPT, PRICE), Ok(PRICE));
+    assert_eq!(check(&bytes), PAID);
 }
 
 #[test]
@@ -278,7 +301,8 @@ fn malformed_atomic_subject_is_still_a_parse_error() {
     let mut bytes = chain_atomic(2);
     bytes[4..36].fill(0);
     assert!(matches!(
-        verify_payment_output(&bytes, 0, SCRIPT, PRICE),
-        Err(PaymentOutputError::MalformedTransaction(message)) if message == "Atomic transaction not found"
+        check(&bytes),
+        PaymentVerdict::Unverifiable(UnverifiableReason::MalformedTransaction(message))
+            if message == "Atomic transaction not found"
     ));
 }
