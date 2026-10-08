@@ -31,7 +31,10 @@ pub use auth::{
     sign_message, verify_message_signature, SessionStorage,
 };
 pub use error::{AuthError, Result};
-pub use payment::{payment_headers, PaymentStorage};
+pub use payment::{
+    brc29_locking_script, payment_headers, verify_payment_output, PaymentOutputError,
+    PaymentStorage,
+};
 pub use transport::auth_headers;
 pub use types::{
     AuthContext, BsvPayment, ErrorResponse, PaymentContext, StoredPayment, StoredSession,
