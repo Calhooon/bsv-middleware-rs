@@ -8,7 +8,7 @@ Provides the protocol logic for authenticating HTTP requests using BSV cryptogra
 
 ```toml
 [dependencies]
-bsv-middleware-rs = "0.1"
+bsv-middleware-rs = "0.3"            # features = ["axum"] for the Axum payment gate
 bsv-rs = { version = "0.3", features = ["auth", "wallet"] }
 ```
 
@@ -18,6 +18,8 @@ bsv-rs = { version = "0.3", features = ["auth", "wallet"] }
 |--------|-------------|
 | **auth** | BRC-31 message signing/verification, `SessionStorage` trait |
 | **payment** | BRC-29 HMAC nonce creation/verification, 402 flow helpers, `PaymentStorage` trait |
+| **payment_core** | The payment-output rule with no runtime types: `verify_payment` answers one of six words (`PaymentVerdict`), takes a `HeaderService` trait, fails closed without one |
+| **axum_layer** (feature `axum`) | `require_payment` (the gate) and the `VerifiedPayment` extractor for Axum 0.8 |
 | **transport** | BRC-104 header constants, binary payload serialization (varints) |
 | **types** | `AuthContext`, `StoredSession`, `BsvPayment`, `PaymentContext` |
 | **error** | `AuthError` with HTTP status codes and machine-readable error codes |
@@ -43,6 +45,29 @@ let nonce = create_derivation_prefix(&wallet)?;
 let valid = verify_derivation_prefix(&wallet, &nonce)?;
 ```
 
+## Verifying a payment
+
+```rust
+use bsv_middleware_rs::{brc29_locking_script, verify_payment, PaymentToVerify, PaymentVerdict};
+
+let script = brc29_locking_script(&wallet, &prefix, &suffix, &sender_identity_key)?;
+let verdict = verify_payment(
+    &PaymentToVerify { transaction: &beef, output_index: 0, expected_script: &script, required_satoshis: 100 },
+    Some(&my_header_service), // None answers NoHeaderService: a server fault
+).await;
+match verdict {
+    PaymentVerdict::Verified { satoshis } => { /* internalize, then serve */ }
+    PaymentVerdict::Underpaid { .. } | PaymentVerdict::WrongScript { .. } => { /* 402, a fresh challenge */ }
+    PaymentVerdict::NoHeaderService => { /* 500: configure a header service */ }
+    PaymentVerdict::RootMismatch { .. } => { /* 400: the proof is not on the chain */ }
+    PaymentVerdict::Unverifiable(reason) => { /* 503 if reason.is_server_side(), else 400 */ }
+}
+```
+
+The rule is pinned by `conformance/brc29-payment-vectors.json` (20 cases), run by
+`tests/conformance_brc29.rs`. `verify_payment_output_only` is the output check without SPV,
+for a host whose next step verifies the transaction itself; it is opted into by name.
+
 ## Example: Axum server
 
 See [`examples/axum_server.rs`](examples/axum_server.rs) for a complete server with:
@@ -53,7 +78,7 @@ See [`examples/axum_server.rs`](examples/axum_server.rs) for a complete server w
 - Signed responses
 
 ```bash
-cargo run --example axum_server
+cargo run --features axum --example axum_server
 ```
 
 ## Architecture

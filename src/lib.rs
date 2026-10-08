@@ -22,6 +22,8 @@
 //! then use the protocol functions to build your framework-specific middleware.
 
 pub mod auth;
+#[cfg(feature = "axum")]
+pub mod axum_layer;
 pub mod error;
 pub mod payment;
 pub mod payment_core;

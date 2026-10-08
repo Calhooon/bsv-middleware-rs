@@ -34,6 +34,14 @@ getrandom = "0.4"
 # Async traits
 async-trait = "0.1"
 
+# The Axum adapter (`axum_layer`), behind the `axum` feature.
+axum = { version = "0.8", optional = true, default-features = false }
+
+[features]
+default = []
+# The payment gate and extractor for Axum 0.8 (`bsv_middleware_rs::axum_layer`).
+axum = ["dep:axum"]
+
 # Cloudflare Workers (wasm32-unknown-unknown) take randomness from the JS host;
 # the Workers call the payment check here, so the crate must build there.
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
@@ -42,3 +50,8 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
+tower = { version = "0.5", features = ["util"] }
+
+[[example]]
+name = "axum_server"
+required-features = ["axum"]
