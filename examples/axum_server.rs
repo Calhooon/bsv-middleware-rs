@@ -28,14 +28,15 @@ use axum::{
     Extension, Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use bsv_middleware_rs::payment::{
-    build_402_headers, create_derivation_prefix, parse_payment_header, payment_headers,
-    verify_derivation_prefix,
-};
+use bsv_middleware_rs::axum_layer::{require_payment, PaymentGate, VerifiedPayment};
+use bsv_middleware_rs::payment::{create_derivation_prefix, payment_headers};
 use bsv_middleware_rs::transport::{
     auth_headers, build_request_payload, filter_signable_headers, HttpResponseData,
 };
-use bsv_middleware_rs::{sign_message, verify_message_signature, SessionStorage, StoredSession};
+use bsv_middleware_rs::{
+    sign_message, verify_message_signature, AuthContext, HeaderService, SessionStorage,
+    StoredSession,
+};
 use bsv_rs::auth::{AuthMessage, MessageType, AUTH_VERSION};
 use bsv_rs::primitives::PrivateKey;
 use bsv_rs::wallet::{Counterparty, CreateSignatureArgs, ProtoWallet, Protocol, SecurityLevel};
@@ -328,6 +329,9 @@ async fn require_auth(
         body: body_bytes,
     };
     let mut req = axum::http::Request::from_parts(parts, axum::body::Body::empty());
+    // The payment gate derives the BRC-29 key for this identity.
+    req.extensions_mut()
+        .insert(AuthContext::authenticated(auth.identity_key.clone()));
     req.extensions_mut().insert(auth);
     next.run(req).await
 }
@@ -437,103 +441,31 @@ async fn hello(
 }
 
 /// POST /api/generate — paid endpoint, 100 satoshis per request.
+///
+/// `require_payment` runs first: it answers 402 with a challenge, refuses a
+/// payment that does not pay this server at least the price, and hands over
+/// the verified payment. Internalize `payment.transaction` with your wallet
+/// (protocol "wallet payment", the prefix, suffix and sender below) before
+/// relying on the funds.
 async fn generate(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     Extension(auth): Extension<Authenticated>,
+    payment: VerifiedPayment,
 ) -> Response {
-    let price: u64 = 100;
-
-    // Check for payment header
-    let payment_value = headers
-        .get(payment_headers::PAYMENT)
-        .and_then(|v| v.to_str().ok());
-
-    match payment_value {
-        // No payment → return 402 with payment instructions
-        None => {
-            let prefix = match create_derivation_prefix(&state.wallet) {
-                Ok(p) => p,
-                Err(e) => {
-                    return err_json(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "ERR_NONCE",
-                        &e.to_string(),
-                    )
-                }
-            };
-
-            let pay_headers = build_402_headers(price, &prefix);
-            let mut hdrs = HeaderMap::new();
-            for (k, v) in &pay_headers {
-                if let (Ok(name), Ok(val)) = (
-                    k.parse::<axum::http::HeaderName>(),
-                    v.parse::<axum::http::HeaderValue>(),
-                ) {
-                    hdrs.insert(name, val);
-                }
-            }
-
-            let body = json!({
-                "status": "error",
-                "code": "ERR_PAYMENT_REQUIRED",
-                "satoshisRequired": price,
-                "description": "Send 100 satoshis to access this endpoint."
-            });
-
-            (
-                StatusCode::PAYMENT_REQUIRED,
-                hdrs,
-                serde_json::to_string(&body).unwrap(),
-            )
-                .into_response()
-        }
-
-        // Payment provided → verify and fulfill
-        Some(payment_json) => {
-            let payment = match parse_payment_header(payment_json) {
-                Ok(p) => p,
-                Err(_) => {
-                    return err_json(
-                        StatusCode::BAD_REQUEST,
-                        "ERR_PAYMENT",
-                        "Invalid payment JSON",
-                    )
-                }
-            };
-
-            // Verify the derivation prefix was issued by this server
-            match verify_derivation_prefix(&state.wallet, &payment.derivation_prefix) {
-                Ok(true) => {}
-                _ => {
-                    return err_json(
-                        StatusCode::BAD_REQUEST,
-                        "ERR_PAYMENT",
-                        "Invalid derivation prefix",
-                    )
-                }
-            }
-
-            // TODO: In production, internalize the transaction via your wallet:
-            //   wallet.internalize_action(payment.transaction, outputs, ...)
-            // This example accepts the payment on trust for demonstration.
-
-            signed_response(
-                &state.wallet,
-                &auth.session,
-                &auth.request_id,
-                StatusCode::OK,
-                json!({
-                    "result": "Here is your generated content!",
-                    "satoshis_paid": price,
-                }),
-                vec![(
-                    payment_headers::SATOSHIS_PAID.to_string(),
-                    price.to_string(),
-                )],
-            )
-        }
-    }
+    signed_response(
+        &state.wallet,
+        &auth.session,
+        &auth.request_id,
+        StatusCode::OK,
+        json!({
+            "result": "Here is your generated content!",
+            "satoshis_paid": payment.satoshis_paid,
+        }),
+        vec![(
+            payment_headers::SATOSHIS_PAID.to_string(),
+            payment.satoshis_paid.to_string(),
+        )],
+    )
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────
@@ -562,6 +494,12 @@ async fn main() {
     println!("    POST /api/generate      — authenticated (100 sat)");
     println!();
 
+    // Your header service (a ChainTracks you run, a cached header store):
+    // implement `HeaderService` for it. With none, every payment is refused
+    // as a server fault (500 ERR_SERVER_MISCONFIGURED), never served unchecked.
+    let header_service: Option<Arc<dyn HeaderService>> = None;
+    let payment_gate = Arc::new(PaymentGate::new(wallet.clone(), 100, header_service));
+
     let state = Arc::new(AppState {
         wallet,
         sessions: MemorySessionStorage::new(),
@@ -570,7 +508,13 @@ async fn main() {
     // Protected routes with auth middleware
     let api = Router::new()
         .route("/api/hello", get(hello))
-        .route("/api/generate", post(generate))
+        .route(
+            "/api/generate",
+            post(generate).layer(middleware::from_fn_with_state(
+                payment_gate,
+                require_payment,
+            )),
+        )
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     let app = Router::new()
