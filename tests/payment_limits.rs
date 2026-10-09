@@ -1,363 +1,393 @@
-//! Small boundary witnesses for the shared payment door (P0-5d, issue #57).
-//! No exhaustion shapes: at most 129 transactions or 33 single-leaf BUMPs.
+//! The shared payment door reads a BEEF of any size (bsv-stack-lean, the
+//! no-limits program, NL-5; the charter `docs/charters/beef-of-any-size.md`).
 //!
-//! Since 0.3.0 the door answers in the six words: a refusal by a limit is
-//! `Unverifiable` with the reason naming the count and the bound, before the
-//! parse; the output-only check is used so no header service is in play.
+//! These are 0.2.2's boundary witnesses (P0-5d, issue #57) inverted: what the
+//! door refused for its bytes or its counts it now reads, and accepts when it
+//! is valid; what it refuses, it refuses for invalid bytes, naming the offset
+//! and the kind. The numbers 4 MiB, 128 and 32 below are the bounds 0.2.2
+//! carried, kept here as plain numbers: the crate exports none of them.
 
 use async_trait::async_trait;
 use bsv_middleware_rs::{
-    verify_payment, verify_payment_output_only, verify_payment_output_only_with_limits,
-    verify_payment_with_limits, HeaderLookupError, HeaderService, PaymentToVerify, PaymentVerdict,
-    UnverifiableReason, MAX_PAYMENT_BEEF_BUMPS, MAX_PAYMENT_BEEF_TXS, MAX_PAYMENT_BYTES,
-    PAYMENT_BEEF_LIMITS,
+    verify_payment, verify_payment_output_only, HeaderLookupError, HeaderService, PaymentToVerify,
+    PaymentVerdict,
 };
-use bsv_rs::script::{LockingScript, UnlockingScript};
-use bsv_rs::transaction::{
-    Beef, BeefLimits, MerklePath, Transaction, TransactionInput, TransactionOutput,
-};
+use bsv_rs::primitives::sha256d;
+use bsv_rs::transaction::{Beef, MerklePath};
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 const SCRIPT: &[u8] = &[0x51];
 const PRICE: u64 = 100;
 const PAID: PaymentVerdict = PaymentVerdict::Verified { satoshis: PRICE };
+const HEIGHT: u32 = 800_000;
 
-fn payment(transaction: &[u8]) -> PaymentToVerify<'_> {
-    PaymentToVerify {
+/// The bounds of 0.2.2, which no longer decide anything.
+const OLD_MAX_BYTES: usize = 4 * 1024 * 1024;
+const OLD_MAX_TXS: usize = 128;
+const OLD_MAX_BUMPS: usize = 32;
+
+/// The headers of a payment: the root at each height, and the heights asked.
+struct Roots {
+    roots: HashMap<u32, String>,
+    asked: Mutex<Vec<u32>>,
+}
+
+impl Roots {
+    fn of(roots: &[(u32, String)]) -> Self {
+        Self {
+            roots: roots.iter().cloned().collect(),
+            asked: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn asked(&self) -> Vec<u32> {
+        self.asked.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl HeaderService for Roots {
+    async fn merkle_root_at(&self, height: u32) -> Result<String, HeaderLookupError> {
+        self.asked.lock().unwrap().push(height);
+        self.roots
+            .get(&height)
+            .cloned()
+            .ok_or_else(|| HeaderLookupError(format!("no header at {height}")))
+    }
+}
+
+/// The output check alone.
+fn check(transaction: &[u8]) -> PaymentVerdict {
+    verify_payment_output_only(&PaymentToVerify {
         transaction,
         output_index: 0,
         expected_script: SCRIPT,
         required_satoshis: PRICE,
-    }
+    })
 }
 
-fn check(transaction: &[u8]) -> PaymentVerdict {
-    verify_payment_output_only(&payment(transaction))
+/// The full check against `headers`.
+async fn full(transaction: &[u8], headers: Option<&Roots>) -> PaymentVerdict {
+    verify_payment(
+        &PaymentToVerify {
+            transaction,
+            output_index: 0,
+            expected_script: SCRIPT,
+            required_satoshis: PRICE,
+        },
+        headers.map(|h| h as &dyn HeaderService),
+    )
+    .await
 }
 
-fn check_with(transaction: &[u8], max_bytes: usize, limits: &BeefLimits) -> PaymentVerdict {
-    verify_payment_output_only_with_limits(&payment(transaction), max_bytes, limits)
-}
-
-fn refused(reason: UnverifiableReason) -> PaymentVerdict {
-    PaymentVerdict::Unverifiable(reason)
-}
-
-/// The reason of a refusal, as text; panics on any other word.
-fn reason(verdict: PaymentVerdict, what: &str) -> UnverifiableReason {
+/// The text of a refusal; panics on any other word.
+fn refusal(verdict: PaymentVerdict, what: &str) -> String {
     match verdict {
-        PaymentVerdict::Unverifiable(reason) => reason,
+        PaymentVerdict::Unverifiable(reason) => reason.to_string(),
         other => panic!("{what}: expected Unverifiable, got {other:?}"),
     }
 }
 
-fn small_transaction(source: String, nonce: u32) -> Transaction {
-    let mut tx = Transaction::new();
-    let mut input = TransactionInput::new(source, 0);
-    input.unlocking_script = Some(UnlockingScript::new());
-    tx.inputs.push(input);
-    tx.outputs.push(TransactionOutput::new(
-        PRICE,
-        LockingScript::from_binary(SCRIPT).expect("OP_TRUE"),
-    ));
-    tx.lock_time = nonce;
-    tx
+fn varint(n: u64) -> Vec<u8> {
+    match n {
+        0..=0xFC => vec![n as u8],
+        0xFD..=0xFFFF => [&[0xFD][..], &(n as u16).to_le_bytes()].concat(),
+        0x1_0000..=0xFFFF_FFFF => [&[0xFE][..], &(n as u32).to_le_bytes()].concat(),
+        _ => [&[0xFF][..], &n.to_le_bytes()].concat(),
+    }
 }
 
-// P0-5 tests/beef_limits.rs shape: a proven root and small unproven ancestors.
-fn chain_atomic(count: usize) -> Vec<u8> {
-    let funding = small_transaction("aa".repeat(32), 0);
-    let mut subject = funding.id();
+/// A raw transaction with one input per source, each spending output 0 with
+/// an empty unlock, paying `PRICE` to `OP_TRUE` at output 0 and, when
+/// `padding` is not 0, a second output of no satoshis whose script is
+/// `OP_FALSE OP_RETURN` and one push of `padding` bytes. Never signed, never
+/// broadcast.
+fn raw_tx(sources: &[[u8; 32]], nonce: u32, padding: usize) -> Vec<u8> {
+    let mut v = 1u32.to_le_bytes().to_vec();
+    v.extend(varint(sources.len() as u64));
+    for source in sources {
+        v.extend_from_slice(source);
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v.push(0);
+        v.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    }
+    v.push(if padding == 0 { 1 } else { 2 });
+    v.extend_from_slice(&PRICE.to_le_bytes());
+    v.extend(varint(SCRIPT.len() as u64));
+    v.extend_from_slice(SCRIPT);
+    if padding != 0 {
+        v.extend_from_slice(&0u64.to_le_bytes());
+        v.extend(varint(padding as u64 + 7));
+        v.extend_from_slice(&[0x00, 0x6a, 0x4e]);
+        v.extend_from_slice(&(padding as u32).to_le_bytes());
+        v.resize(v.len() + padding, 0xAB);
+    }
+    v.extend_from_slice(&nonce.to_le_bytes());
+    v
+}
+
+/// The txid of a raw transaction, in wire order.
+fn txid(raw: &[u8]) -> [u8; 32] {
+    sha256d(raw)
+}
+
+/// A txid as the SDK names it (the bytes reversed, in hex).
+fn display(txid: &[u8; 32]) -> String {
+    let mut bytes = *txid;
+    bytes.reverse();
+    hex::encode(bytes)
+}
+
+/// The P0-5 shape: a funding transaction proven by a one-leaf BUMP at
+/// `HEIGHT` and `count - 1` unproven transactions, each spending the one
+/// before. The last carries `padding` bytes nothing spends. Returns the
+/// Atomic BEEF and its one root.
+fn chain_atomic(count: usize, padding: usize) -> (Vec<u8>, Vec<(u32, String)>) {
+    let funding = raw_tx(&[[0xAA; 32]], 0, 0);
+    let mut subject = txid(&funding);
+    let root = display(&subject);
     let mut beef = Beef::new();
-    let bump = beef.merge_bump(MerklePath::from_coinbase_txid(&subject, 800_000));
-    beef.merge_raw_tx(funding.to_binary(), Some(bump));
+    let bump = beef.merge_bump(MerklePath::from_coinbase_txid(&root, HEIGHT));
+    beef.merge_raw_tx(funding, Some(bump));
     for nonce in 1..count {
-        let tx = small_transaction(subject, nonce as u32);
-        subject = tx.id();
-        beef.merge_raw_tx(tx.to_binary(), None);
+        let last = nonce + 1 == count;
+        let raw = raw_tx(&[subject], nonce as u32, if last { padding } else { 0 });
+        subject = txid(&raw);
+        beef.merge_raw_tx(raw, None);
     }
     assert_eq!(beef.txs.len(), count);
-    beef.to_binary_atomic(&subject).expect("Atomic BEEF")
+    let bytes = beef
+        .to_binary_atomic(&display(&subject))
+        .expect("Atomic BEEF");
+    (bytes, vec![(HEIGHT, root)])
 }
 
-// Every proof belongs to a funding input of the subject. Distinct heights keep
-// the single-leaf BUMPs separate; no unrelated padding branches are needed.
-fn funded_atomic(bump_count: usize) -> Vec<u8> {
+/// A subject funded by `bump_count` transactions, each proven by its own
+/// one-leaf BUMP at its own height. Returns the Atomic BEEF and its roots.
+fn funded_atomic(bump_count: usize) -> (Vec<u8>, Vec<(u32, String)>) {
     let mut beef = Beef::new();
-    let mut subject = Transaction::new();
-    subject.outputs.push(TransactionOutput::new(
-        PRICE,
-        LockingScript::from_binary(SCRIPT).expect("OP_TRUE"),
-    ));
+    let mut sources = Vec::new();
+    let mut roots = Vec::new();
     for nonce in 0..bump_count {
-        let funding = small_transaction("aa".repeat(32), nonce as u32);
-        let txid = funding.id();
-        let bump = beef.merge_bump(MerklePath::from_coinbase_txid(
-            &txid,
-            800_000 + nonce as u32,
-        ));
-        beef.merge_raw_tx(funding.to_binary(), Some(bump));
-        let mut input = TransactionInput::new(txid, 0);
-        input.unlocking_script = Some(UnlockingScript::new());
-        subject.inputs.push(input);
+        let funding = raw_tx(&[[0xAA; 32]], nonce as u32, 0);
+        let id = txid(&funding);
+        let height = HEIGHT + nonce as u32;
+        let bump = beef.merge_bump(MerklePath::from_coinbase_txid(&display(&id), height));
+        beef.merge_raw_tx(funding, Some(bump));
+        sources.push(id);
+        roots.push((height, display(&id)));
     }
-    let txid = subject.id();
-    beef.merge_raw_tx(subject.to_binary(), None);
+    let subject = raw_tx(&sources, 0, 0);
+    let id = display(&txid(&subject));
+    beef.merge_raw_tx(subject, None);
     assert_eq!(beef.bumps.len(), bump_count);
     assert_eq!(beef.txs.len(), bump_count + 1);
-    beef.to_binary_atomic(&txid).expect("Atomic BEEF")
+    (beef.to_binary_atomic(&id).expect("Atomic BEEF"), roots)
 }
 
-fn malformed_atomic(length: usize) -> Vec<u8> {
-    let mut bytes = vec![0; length];
+/// The heights of `roots`, lowest first: the order the door asks in.
+fn heights(roots: &[(u32, String)]) -> Vec<u32> {
+    let mut heights: Vec<u32> = roots.iter().map(|(h, _)| *h).collect();
+    heights.sort_unstable();
+    heights
+}
+
+// ---- a valid payment is never refused for its bytes ----
+
+#[tokio::test]
+async fn a_valid_payment_over_the_old_byte_bound_is_verified() {
+    let (bytes, roots) = chain_atomic(2, OLD_MAX_BYTES);
+    assert!(bytes.len() > OLD_MAX_BYTES + 1);
+    assert_eq!(check(&bytes), PAID);
+    let headers = Roots::of(&roots);
+    assert_eq!(full(&bytes, Some(&headers)).await, PAID);
+    assert_eq!(headers.asked(), vec![HEIGHT]);
+}
+
+#[test]
+fn a_raw_transaction_over_the_old_byte_bound_passes_the_output_check() {
+    let raw = raw_tx(&[[0xAA; 32]], 0, OLD_MAX_BYTES);
+    assert!(raw.len() > OLD_MAX_BYTES + 1);
+    assert_eq!(check(&raw), PAID);
+}
+
+#[tokio::test]
+async fn garbage_over_the_old_byte_bound_is_refused_for_its_bytes_not_its_length() {
+    // The Atomic prefix, then an inner version word of zero, then zeros.
+    let mut bytes = vec![0; OLD_MAX_BYTES + 1];
     bytes[..4].copy_from_slice(&[1, 1, 1, 1]);
-    // The inner version is zero, so parsing stops without walking any entries.
-    bytes
-}
-
-#[test]
-fn one_byte_over_is_refused_before_atomic_parsing() {
-    let bytes = malformed_atomic(MAX_PAYMENT_BYTES + 1);
-    let error = reason(check(&bytes), "over byte bound");
-    let message = error.to_string();
-    assert!(message.contains("4194305"), "names the length: {message}");
-    assert!(
-        message.contains("max_bytes 4194304"),
-        "names the bound: {message}"
-    );
-}
-
-#[test]
-fn one_byte_over_is_refused_before_raw_parsing() {
-    let bytes = vec![0; MAX_PAYMENT_BYTES + 1];
-    let error = reason(check(&bytes), "over byte bound");
-    let message = error.to_string();
-    assert!(message.contains("4194305"), "names the length: {message}");
-    assert!(
-        message.contains("max_bytes 4194304"),
-        "names the bound: {message}"
-    );
-}
-
-#[test]
-fn exactly_the_byte_bound_reaches_the_parser() {
-    let bytes = malformed_atomic(MAX_PAYMENT_BYTES);
-    let error = reason(check(&bytes), "invalid inner version");
-    assert!(matches!(error, UnverifiableReason::MalformedTransaction(_)));
-    assert!(error.to_string().contains("Invalid BEEF version"));
-}
-
-#[test]
-fn exactly_the_transaction_bound_is_admitted() {
-    let bytes = chain_atomic(MAX_PAYMENT_BEEF_TXS);
-    assert_eq!(check(&bytes), PAID);
-}
-
-#[test]
-fn one_transaction_over_is_refused_with_the_count_and_bound() {
-    let bytes = chain_atomic(MAX_PAYMENT_BEEF_TXS + 1);
-    let error = reason(check(&bytes), "129 transactions");
-    let message = error.to_string();
-    assert!(
-        message.contains("129 transactions"),
-        "names the count: {message}"
-    );
-    assert!(
-        message.contains("max_txs 128"),
-        "names the bound: {message}"
-    );
-}
-
-#[test]
-fn exactly_the_bump_bound_is_admitted() {
-    let bytes = funded_atomic(MAX_PAYMENT_BEEF_BUMPS);
-    assert_eq!(check(&bytes), PAID);
-}
-
-#[test]
-fn one_bump_over_is_refused_with_the_count_and_bound() {
-    let bytes = funded_atomic(MAX_PAYMENT_BEEF_BUMPS + 1);
-    let error = reason(check(&bytes), "33 BUMPs");
-    let message = error.to_string();
-    assert!(message.contains("33 BUMPs"), "names the count: {message}");
-    assert!(
-        message.contains("max_bumps 32"),
-        "names the bound: {message}"
-    );
-}
-
-#[test]
-fn custom_byte_budget_is_checked_before_parsing_either_format() {
-    for bytes in [vec![0; 41], malformed_atomic(41)] {
-        assert_eq!(
-            check_with(&bytes, 40, &PAYMENT_BEEF_LIMITS),
-            refused(UnverifiableReason::PaymentTooLarge {
-                bytes: 41,
-                max_bytes: 40,
-            })
-        );
-    }
-}
-
-#[test]
-fn custom_beef_byte_budget_can_be_smaller_than_the_outer_budget() {
-    let bytes = malformed_atomic(41);
-    let limits = BeefLimits {
-        max_bytes: 40,
-        ..PAYMENT_BEEF_LIMITS
-    };
-    assert_eq!(
-        check_with(&bytes, 41, &limits),
-        refused(UnverifiableReason::PaymentTooLarge {
-            bytes: 41,
-            max_bytes: 40
-        })
-    );
-}
-
-#[test]
-fn custom_beef_counts_admit_at_the_bound_and_refuse_one_over() {
-    let limits = BeefLimits {
-        max_txs: 4,
-        max_bumps: 2,
-        max_bytes: MAX_PAYMENT_BYTES,
-    };
-    let at_bound = chain_atomic(4);
-    assert_eq!(check_with(&at_bound, at_bound.len(), &limits), PAID);
-    let one_over = chain_atomic(5);
-    assert_eq!(
-        check_with(&one_over, one_over.len(), &limits),
-        refused(UnverifiableReason::BeefTransactionsExceeded {
-            count: 5,
-            max_txs: 4
-        })
-    );
-    let at_bound = funded_atomic(2);
-    assert_eq!(check_with(&at_bound, at_bound.len(), &limits), PAID);
-    let one_over = funded_atomic(3);
-    assert_eq!(
-        check_with(&one_over, one_over.len(), &limits),
-        refused(UnverifiableReason::BeefBumpsExceeded {
-            count: 3,
-            max_bumps: 2
-        })
-    );
-}
-
-#[test]
-fn a_caller_can_admit_counts_above_the_default_budgets() {
-    let limits = BeefLimits {
-        max_txs: MAX_PAYMENT_BEEF_TXS + 1,
-        max_bumps: MAX_PAYMENT_BEEF_BUMPS + 1,
-        max_bytes: MAX_PAYMENT_BYTES,
-    };
-    for bytes in [
-        chain_atomic(limits.max_txs),
-        funded_atomic(limits.max_bumps),
+    let headers = Roots::of(&[]);
+    for text in [
+        refusal(check(&bytes), "a zero version word"),
+        refusal(full(&bytes, Some(&headers)).await, "a zero version word"),
     ] {
-        assert_eq!(check_with(&bytes, bytes.len(), &limits), PAID);
+        assert!(text.contains("offset 36"), "names the offset: {text}");
+        assert!(text.contains("BadVersion"), "names the kind: {text}");
+        assert!(!text.contains("max_bytes"), "names no bound: {text}");
+        assert!(!text.contains("4194305"), "names no length: {text}");
     }
+    assert!(headers.asked().is_empty());
 }
 
-#[test]
-fn raw_transactions_ignore_beef_budgets_and_admit_the_exact_byte_budget() {
-    let raw = small_transaction("aa".repeat(32), 0).to_binary();
-    let limits = BeefLimits {
-        max_txs: 0,
-        max_bumps: 0,
-        max_bytes: 0,
-    };
-    assert_eq!(check_with(&raw, raw.len(), &limits), PAID);
-    assert_eq!(
-        check_with(&raw, raw.len() - 1, &limits),
-        refused(UnverifiableReason::PaymentTooLarge {
-            bytes: raw.len(),
-            max_bytes: raw.len() - 1
-        })
-    );
-}
+// ---- nor for its counts ----
 
-#[test]
-fn the_declared_atomic_subject_is_used_even_when_it_is_not_last() {
-    let mut beef = Beef::from_binary(&chain_atomic(3)).expect("honest BEEF");
-    let subject = beef.atomic_txid.clone().expect("Atomic subject");
-    // A retained descendant sorts after the declared subject. Historical
-    // Atomic writers could retain branches beyond the subject (reference
-    // payment-express-middleware/src/index.ts:110-112 at fb1b2da).
-    let mut different = small_transaction(subject.clone(), 99);
-    different.outputs[0].satoshis = Some(PRICE - 1);
-    beef.merge_raw_tx(different.to_binary(), None);
-    let bytes = beef.to_binary_atomic(&subject).expect("Atomic BEEF");
-    assert_ne!(
-        Beef::from_binary(&bytes)
-            .expect("BEEF")
-            .txs
-            .last()
-            .unwrap()
-            .txid(),
-        subject
-    );
-    assert_eq!(check(&bytes), PAID);
-}
-
-#[test]
-fn malformed_atomic_subject_is_still_a_parse_error() {
-    let mut bytes = chain_atomic(2);
-    bytes[4..36].fill(0);
-    assert!(matches!(
-        check(&bytes),
-        PaymentVerdict::Unverifiable(UnverifiableReason::MalformedTransaction(message))
-            if message == "Atomic transaction not found"
-    ));
-}
-
-/// A header service that must never be asked.
-struct NeverAsked;
-
-#[async_trait]
-impl HeaderService for NeverAsked {
-    async fn merkle_root_at(&self, height: u32) -> Result<String, HeaderLookupError> {
-        panic!("a refusal by a limit asks no header (height {height})");
+#[tokio::test]
+async fn the_old_transaction_bound_and_one_over_are_both_verified() {
+    for count in [OLD_MAX_TXS, OLD_MAX_TXS + 1, 1_000] {
+        let (bytes, roots) = chain_atomic(count, 0);
+        assert_eq!(check(&bytes), PAID, "{count} transactions");
+        let headers = Roots::of(&roots);
+        assert_eq!(
+            full(&bytes, Some(&headers)).await,
+            PAID,
+            "{count} transactions"
+        );
+        assert_eq!(headers.asked(), vec![HEIGHT]);
     }
 }
 
 #[tokio::test]
-async fn the_full_check_refuses_by_the_same_limits_before_any_lookup() {
-    let headers = NeverAsked;
-    let over_bytes = malformed_atomic(MAX_PAYMENT_BYTES + 1);
+async fn the_old_bump_bound_and_one_over_are_both_verified() {
+    for count in [OLD_MAX_BUMPS, OLD_MAX_BUMPS + 1, 200] {
+        let (bytes, roots) = funded_atomic(count);
+        assert_eq!(check(&bytes), PAID, "{count} BUMPs");
+        let headers = Roots::of(&roots);
+        assert_eq!(full(&bytes, Some(&headers)).await, PAID, "{count} BUMPs");
+        // Every root is asked once, lowest height first.
+        assert_eq!(headers.asked(), heights(&roots));
+    }
+}
+
+// ---- a refusal is for invalid bytes, and names them ----
+
+#[tokio::test]
+async fn a_tree_height_of_65_is_refused_at_its_offset_with_its_kind() {
+    let (mut bytes, roots) = funded_atomic(OLD_MAX_BUMPS + 1);
+    // 36 bytes of Atomic prefix, the version word, the BUMP count, the block
+    // height as a five-byte varint: the tree-height byte of BUMP 0 is at 46.
+    assert_eq!(bytes[41], 0xFE);
+    assert_eq!(bytes[46], 1);
+    bytes[46] = 65;
+    let headers = Roots::of(&roots);
+    for text in [
+        refusal(check(&bytes), "tree height 65"),
+        refusal(full(&bytes, Some(&headers)).await, "tree height 65"),
+    ] {
+        assert!(text.contains("offset 46"), "names the offset: {text}");
+        assert!(text.contains("TreeHeightOver64"), "names the kind: {text}");
+    }
+    assert!(headers.asked().is_empty(), "no header for invalid bytes");
+}
+
+#[tokio::test]
+async fn a_payment_cut_short_is_refused_at_the_field_that_ran_out() {
+    let (mut bytes, roots) = chain_atomic(OLD_MAX_TXS + 1, 0);
+    // The last transaction ends: satoshis (8), script length (1), script (1),
+    // lock time (4). Ten bytes off leaves four of the eight satoshi bytes.
+    let field = bytes.len() - 14;
+    bytes.truncate(bytes.len() - 10);
+    let headers = Roots::of(&roots);
+    for text in [
+        refusal(check(&bytes), "cut short"),
+        refusal(full(&bytes, Some(&headers)).await, "cut short"),
+    ] {
+        assert!(
+            text.contains(&format!("offset {field}")),
+            "names the offset {field}: {text}"
+        );
+        assert!(text.contains("Truncated"), "names the kind: {text}");
+    }
+    assert!(headers.asked().is_empty(), "no header for invalid bytes");
+}
+
+#[tokio::test]
+async fn a_claimed_count_is_refused_for_the_bytes_it_does_not_have() {
+    // A plain BEEF V2 claiming 4,294,967,295 BUMPs and carrying none.
+    let mut bytes = 0xEFBE_0002u32.to_le_bytes().to_vec();
+    bytes.extend_from_slice(&[0xFE, 0xFF, 0xFF, 0xFF, 0xFF]);
+    let headers = Roots::of(&[]);
+    for text in [
+        refusal(check(&bytes), "a claimed count"),
+        refusal(full(&bytes, Some(&headers)).await, "a claimed count"),
+    ] {
+        assert!(text.contains("offset 9"), "names the offset: {text}");
+        assert!(text.contains("BadVarint"), "names the kind: {text}");
+        assert!(!text.contains("4294967295"), "names no count: {text}");
+    }
+}
+
+// ---- what does not move ----
+
+#[tokio::test]
+async fn no_header_service_is_answered_before_the_payment_is_read() {
+    let (bytes, _) = chain_atomic(OLD_MAX_TXS + 1, 0);
+    assert_eq!(full(&bytes, None).await, PaymentVerdict::NoHeaderService);
     assert_eq!(
-        verify_payment(&payment(&over_bytes), Some(&headers)).await,
-        refused(UnverifiableReason::PaymentTooLarge {
-            bytes: MAX_PAYMENT_BYTES + 1,
-            max_bytes: MAX_PAYMENT_BYTES,
-        })
-    );
-    let over_txs = chain_atomic(MAX_PAYMENT_BEEF_TXS + 1);
-    assert_eq!(
-        verify_payment(&payment(&over_txs), Some(&headers)).await,
-        refused(UnverifiableReason::BeefTransactionsExceeded {
-            count: MAX_PAYMENT_BEEF_TXS + 1,
-            max_txs: MAX_PAYMENT_BEEF_TXS,
-        })
-    );
-    let over_bumps = funded_atomic(MAX_PAYMENT_BEEF_BUMPS + 1);
-    assert_eq!(
-        verify_payment(&payment(&over_bumps), Some(&headers)).await,
-        refused(UnverifiableReason::BeefBumpsExceeded {
-            count: MAX_PAYMENT_BEEF_BUMPS + 1,
-            max_bumps: MAX_PAYMENT_BEEF_BUMPS,
-        })
-    );
-    let small = chain_atomic(2);
-    assert_eq!(
-        verify_payment_with_limits(&payment(&small), Some(&headers), 40, &PAYMENT_BEEF_LIMITS)
-            .await,
-        refused(UnverifiableReason::PaymentTooLarge {
-            bytes: small.len(),
-            max_bytes: 40,
-        })
-    );
-    // No header service is the server's fault and is answered first.
-    assert_eq!(
-        verify_payment(&payment(&over_bytes), None).await,
+        full(b"garbage", None).await,
         PaymentVerdict::NoHeaderService
     );
+}
+
+#[tokio::test]
+async fn a_root_the_headers_do_not_carry_is_a_mismatch_at_any_size() {
+    let (bytes, _) = chain_atomic(OLD_MAX_TXS + 1, 0);
+    let headers = Roots::of(&[(HEIGHT, "00".repeat(32))]);
+    assert!(matches!(
+        full(&bytes, Some(&headers)).await,
+        PaymentVerdict::RootMismatch { height: HEIGHT, .. }
+    ));
+}
+
+#[test]
+fn the_output_check_reads_the_declared_atomic_subject() {
+    let (bytes, _) = chain_atomic(3, 0);
+    let mut beef = Beef::from_binary(&bytes).expect("honest BEEF");
+    let subject = beef.atomic_txid.clone().expect("Atomic subject");
+    // A retained descendant that underpays sorts after the declared subject.
+    let mut wire = [0u8; 32];
+    wire.copy_from_slice(&hex::decode(&subject).unwrap());
+    wire.reverse();
+    let mut descendant = raw_tx(&[wire], 99, 0);
+    let satoshis = descendant.len() - 14;
+    descendant[satoshis..satoshis + 8].copy_from_slice(&(PRICE - 1).to_le_bytes());
+    beef.merge_raw_tx(descendant, None);
+    let bytes = beef.to_binary_atomic(&subject).expect("Atomic BEEF");
+    assert_eq!(check(&bytes), PAID);
+}
+
+#[test]
+fn an_atomic_subject_the_beef_does_not_carry_is_refused() {
+    let (mut bytes, _) = chain_atomic(2, 0);
+    bytes[4..36].fill(0);
+    assert!(matches!(check(&bytes), PaymentVerdict::Unverifiable(_)));
+}
+
+/// The crate's sources name no bound on a payment's bytes or counts.
+#[test]
+fn the_crate_names_no_payment_bound() {
+    let sources = [
+        ("src/lib.rs", include_str!("../src/lib.rs")),
+        ("src/payment.rs", include_str!("../src/payment.rs")),
+        (
+            "src/payment_core.rs",
+            include_str!("../src/payment_core.rs"),
+        ),
+        ("src/axum_layer.rs", include_str!("../src/axum_layer.rs")),
+    ];
+    for (path, source) in sources {
+        for gone in [
+            "MAX_PAYMENT_BYTES",
+            "MAX_PAYMENT_BEEF_TXS",
+            "MAX_PAYMENT_BEEF_BUMPS",
+            "PAYMENT_BEEF_LIMITS",
+            "_with_limits",
+            "BeefLimits",
+            "PaymentTooLarge",
+            "BeefTransactionsExceeded",
+            "BeefBumpsExceeded",
+        ] {
+            assert!(!source.contains(gone), "{path} still names {gone}");
+        }
+    }
 }
