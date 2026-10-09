@@ -9,6 +9,9 @@ repository = "https://github.com/Calhooon/bsv-middleware-rs"
 homepage = "https://github.com/Calhooon/bsv-middleware-rs"
 keywords = ["bitcoin", "bsv", "authentication", "middleware", "micropayments"]
 categories = ["authentication", "cryptography", "web-programming"]
+# The workflows and the repository process files are not part of the crate
+# (no CLAUDE.md exists today; the entry keeps a later one out).
+exclude = ["/.github/", "/RELEASING.md", "/CLAUDE.md"]
 
 [dependencies]
 # BSV SDK - provides auth protocol, wallet, key derivation
