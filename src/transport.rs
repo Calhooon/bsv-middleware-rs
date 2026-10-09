@@ -169,9 +169,9 @@ pub fn filter_signable_headers(headers: &[(String, String)]) -> Vec<(String, Str
     let mut result = Vec::new();
     for (key, value) in headers {
         let lower = key.to_lowercase();
-        if lower.starts_with("x-bsv-") && !lower.starts_with("x-bsv-auth-") {
-            result.push((lower, value.clone()));
-        } else if lower == "authorization" {
+        if (lower.starts_with("x-bsv-") && !lower.starts_with("x-bsv-auth-"))
+            || lower == "authorization"
+        {
             result.push((lower, value.clone()));
         } else if lower == "content-type" {
             // Strip parameters (e.g., "; charset=utf-8"), keep only media type
