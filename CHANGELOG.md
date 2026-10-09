@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-09
+
+- bsv-rs 0.4.1: a transaction with no input is invalid bytes. Under
+  `verify_payment` an unproven one is now the reader's refusal,
+  `Unverifiable(InvalidBeef { kind: NoInputs, .. })` at the transaction's
+  leading byte, before the door's own `NoProof`, which stays beneath it.
+  `verify_payment_output_only` reads a BEEF through the same reader and
+  refuses the same bytes at the same offset, where 0.4.0 judged the output.
+  No other behavior changes: the 22 vectors, `payment_limits` and the Axum
+  tests are unchanged. The unit tests' synthetic roots take the coinbase's
+  one input (the null outpoint); the one transaction with no input is built
+  in the refusal test. (bsv-stack-lean #58, #59.)
+
 ## [0.4.0] - 2026-10-09
 
 The payment door reads a BEEF of any size. The posture, as a rule: a valid

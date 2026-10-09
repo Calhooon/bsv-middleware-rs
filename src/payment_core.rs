@@ -161,6 +161,8 @@ pub enum UnverifiableReason {
     KeyDerivation(String),
     /// The BEEF is valid and gives no root to check: it carries no BUMP, or
     /// an unproven transaction has no input, so nothing beneath it is proven.
+    /// Since bsv-rs 0.4.1 the reader refuses a transaction with no input
+    /// first (`InvalidBeef` with `NoInputs`); this rule stays beneath it.
     NoProof,
     /// The header service could not answer for `height` (outage, timeout,
     /// height not indexed). The server's side, not the payer's.
