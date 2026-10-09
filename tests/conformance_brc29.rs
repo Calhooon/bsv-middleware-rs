@@ -16,10 +16,18 @@
 //! the payment through `verify_payment` with the header service replaced by a
 //! stub answering from `header_service.lookup`; `output` cases also through
 //! `verify_payment_output_only`. The verdict is mapped onto the vector words
-//! and compared with `expected` exactly: 20 of 20, no declared divergence.
+//! and compared with `expected` exactly: 22 of 22, no declared divergence.
 //! The file's `rulings` list records the ruling of 2026-10-08 that
 //! `spv-lookup-error` is `Unverifiable` (fail closed when the header service
-//! cannot answer), which is what this crate answers.
+//! cannot answer) and the ruling of 2026-10-09 on the two no-root cases
+//! (`Unverifiable` on the payer's side, no fields), which is what this crate
+//! answers.
+//!
+//! `Unverifiable` is one word in two classes, by its reason's side: a reason
+//! on the server's side (a header lookup that failed) carries the height and
+//! is 5xx; a reason on the payer's side carries no fields and is 4xx. Each
+//! case's verdict is also held to its HTTP class (the canonical README, "The
+//! six words").
 
 use async_trait::async_trait;
 use bsv_middleware_rs::{
@@ -34,7 +42,7 @@ use std::sync::Mutex;
 const VECTORS: &str = include_str!("vectors/brc29-payment-vectors.json");
 
 /// The sha256 of the pinned copy (the canonical file's bytes).
-const VECTORS_SHA256: &str = "dae68f0b2999b44088e67206b1c34866a2c3f0fee8f0a8c8f4829d313ba13a8d";
+const VECTORS_SHA256: &str = "836579ad73e20ca0e259a6c7cce5b55d85095cf290f74458937aeb39c9b5253c";
 
 /// Where the canonical file is, when its checkout sits beside this one.
 const CANONICAL_SIBLING: &str = concat!(
@@ -81,9 +89,39 @@ fn word(verdict: PaymentVerdict) -> Observed {
         PaymentVerdict::Unverifiable(UnverifiableReason::HeaderLookupFailed { height, .. }) => {
             observed("Unverifiable", json!({ "height": height }))
         }
+        // A reason on the payer's side carries no fields: the law names none.
         PaymentVerdict::Unverifiable(reason) => {
-            observed("Unverifiable", json!({ "reason": format!("{:?}", reason) }))
+            assert!(!reason.is_server_side(), "a server-side reason: {reason:?}");
+            observed("Unverifiable", json!({}))
         }
+    }
+}
+
+/// The HTTP class a host answers a verdict with: a host accepts exactly on
+/// `Verified`; `NoHeaderService` and an `Unverifiable` whose reason is on the
+/// server's side are the server's fault; every other refusal is the payer's.
+fn http_class(verdict: &PaymentVerdict) -> &'static str {
+    match verdict {
+        PaymentVerdict::Verified { .. } => "2xx",
+        PaymentVerdict::Underpaid { .. }
+        | PaymentVerdict::WrongScript { .. }
+        | PaymentVerdict::RootMismatch { .. } => "4xx",
+        PaymentVerdict::NoHeaderService => "5xx",
+        PaymentVerdict::Unverifiable(reason) if reason.is_server_side() => "5xx",
+        PaymentVerdict::Unverifiable(_) => "4xx",
+    }
+}
+
+/// The class the law gives a case: by the word and, for `Unverifiable`, by
+/// whether the expected fields carry the height of a failed lookup.
+fn expected_class(case: &Value) -> &'static str {
+    match case["expected"]["word"].as_str().unwrap() {
+        "Verified" => "2xx",
+        "Underpaid" | "WrongScript" | "RootMismatch" => "4xx",
+        "NoHeaderService" => "5xx",
+        "Unverifiable" if case["expected"]["fields"].get("height").is_some() => "5xx",
+        "Unverifiable" => "4xx",
+        other => panic!("a word outside the six: {other}"),
     }
 }
 
@@ -149,7 +187,9 @@ async fn run_case(case: &Value) -> Observed {
             None,
             "{name}: the URL must name no service"
         );
-        return word(verify_payment(&payment, &tx[..], None).await.unwrap());
+        let verdict = verify_payment(&payment, &tx[..], None).await.unwrap();
+        assert_eq!(http_class(&verdict), expected_class(case), "{name}: class");
+        return word(verdict);
     }
     assert!(
         header_service_url(url).is_some(),
@@ -159,11 +199,11 @@ async fn run_case(case: &Value) -> Observed {
         lookup: case["header_service"]["lookup"].clone(),
         asked: Mutex::new(Vec::new()),
     };
-    let got = word(
-        verify_payment(&payment, &tx[..], Some(&headers))
-            .await
-            .unwrap(),
-    );
+    let verdict = verify_payment(&payment, &tx[..], Some(&headers))
+        .await
+        .unwrap();
+    assert_eq!(http_class(&verdict), expected_class(case), "{name}: class");
+    let got = word(verdict);
     let asked = headers.asked.lock().unwrap().clone();
     if stage == "output" {
         assert_eq!(
@@ -174,6 +214,9 @@ async fn run_case(case: &Value) -> Observed {
         if got.word != "Verified" {
             assert!(asked.is_empty(), "{name}: refused before any lookup");
         }
+    }
+    if case["transaction"]["proof"].is_null() {
+        assert!(asked.is_empty(), "{name}: no root, so nothing is asked");
     }
     if case["requires_merkle_lookup"].as_bool().unwrap() {
         assert_eq!(
@@ -218,7 +261,7 @@ async fn every_vector_case() {
     let file: Value = serde_json::from_str(VECTORS).unwrap();
     assert_eq!(file["schema"], "brc29-payment-vectors/1");
     let cases = file["cases"].as_array().unwrap();
-    assert_eq!(cases.len(), 20);
+    assert_eq!(cases.len(), 22);
     assert_eq!(
         file["words"].as_object().unwrap().len(),
         6,
@@ -251,5 +294,5 @@ async fn every_vector_case() {
         failures.len()
     );
     assert!(failures.is_empty(), "failing cases: {:?}", failures);
-    assert_eq!(exact, 20, "20 of 20 exact");
+    assert_eq!(exact, 22, "22 of 22 exact");
 }
