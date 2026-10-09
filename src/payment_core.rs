@@ -10,10 +10,11 @@
 //! The verdict is a word, never a boolean ([`PaymentVerdict`]); the header
 //! service is a trait ([`HeaderService`]) passed as an `Option`, and `None` is
 //! [`PaymentVerdict::NoHeaderService`] before any other check. The rule is
-//! pinned by `conformance/brc29-payment-vectors.json` (copied from
-//! `bsv-middleware-cloudflare@dabfb78`), run in `tests/conformance_brc29.rs`.
+//! pinned by `tests/vectors/brc29-payment-vectors.json` (20 cases, a
+//! byte-pinned copy of the canonical file the stack review repository owns),
+//! run in `tests/conformance_brc29.rs`.
 //!
-//! Order of checks (the vectors' `conformance/README.md`, "Order of checks"):
+//! Order of checks (the canonical `conformance/README.md`, "Order of checks"):
 //! 1. a header service is configured, else `NoHeaderService`;
 //! 2. the payment is within its byte budget ([`MAX_PAYMENT_BYTES`]) and, for
 //!    a BEEF, its transaction and BUMP counts are within theirs

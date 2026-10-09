@@ -107,14 +107,20 @@ jobs:
           restore-keys: |
             ubuntu-vectors-
 
-      # The 0.3.0 PR extends this job with `cargo test --test conformance_brc29`
-      # (the BRC-29 conformance vectors); until then the payment-bound and
-      # payment tests stand in, so the context name `vectors` is stable.
+      # The BRC-29 conformance vectors (20 cases, a byte-pinned copy under
+      # tests/vectors/) since 0.3.0, beside the payment-bound and payment
+      # tests; the context name `vectors` is stable.
+      - name: Run the BRC-29 conformance vectors
+        run: cargo test --test conformance_brc29
+
       - name: Run the payment-bound tests
         run: cargo test --test payment_limits
 
       - name: Run the payment module tests
         run: cargo test --lib 'payment::'
+
+      - name: Run the payment core tests
+        run: cargo test --lib 'payment_core::'
 
   # Cloudflare Workers call the payment check, so the crate must build there.
   wasm32:
