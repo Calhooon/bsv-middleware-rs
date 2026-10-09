@@ -64,8 +64,48 @@ match verdict {
 }
 ```
 
-The rule is pinned by `conformance/brc29-payment-vectors.json` (20 cases), run by
-`tests/conformance_brc29.rs`. `verify_payment_output_only` is the output check without SPV,
+The six words are the whole answer; `PaymentVerdict` is exhaustive, so a host handles each in one
+match with no catch-all arm:
+
+| word | accept | meaning |
+|------|--------|---------|
+| `Verified { satoshis }` | yes | the output pays the derived key at least the price and every merkle root is a block header's; `satoshis` is the amount read from the output |
+| `Underpaid { paid, required }` | no | the output pays the derived key less than the price |
+| `WrongScript { expected, actual }` | no | the output is not locked to the expected BRC-29 script |
+| `NoHeaderService` | no | no header service is configured: a server fault (5xx), answered before the payment is read |
+| `RootMismatch { height, merkle_root }` | no | the header at that height carries a different merkle root than the proof computes |
+| `Unverifiable(reason)` | no | the payment cannot be verified; `reason.is_server_side()` says whose fault (a header lookup that could not answer is the server's; it fails closed) |
+
+The header service is a trait: implement it over whatever serves your block headers. It returns the
+root and the verifier compares, so the comparison lives in one place.
+
+```rust
+use async_trait::async_trait;
+use bsv_middleware_rs::{HeaderLookupError, HeaderService};
+
+struct MyHeaders { /* a client for your header service */ }
+
+#[async_trait]
+impl HeaderService for MyHeaders {
+    async fn merkle_root_at(&self, height: u32) -> Result<String, HeaderLookupError> {
+        // the merkle root (hex) of the block at `height`, or why it cannot say
+        self.fetch_root(height).await.map_err(|e| HeaderLookupError(e.to_string()))
+    }
+}
+```
+
+`header_service_url` reads a configured base URL and answers `None` for a value that names no
+service (unset, blank, a `.invalid` host): pass `None` to `verify_payment` then.
+
+Before it parses, the verifier refuses a payment over `MAX_PAYMENT_BYTES` (4 MiB) and a BEEF whose
+counts exceed `PAYMENT_BEEF_LIMITS` (128 transactions, 32 BUMPs): `Unverifiable` with
+`PaymentTooLarge`, `BeefTransactionsExceeded` or `BeefBumpsExceeded`, each naming the count and the
+bound. `verify_payment_with_limits` and `verify_payment_output_only_with_limits` take a caller's own
+budgets. `UnverifiableReason` and `AuthError` are `#[non_exhaustive]`: match them with a catch-all
+arm.
+
+The rule is pinned by `tests/vectors/brc29-payment-vectors.json` (20 cases, 20 exact), run by
+`cargo test --test conformance_brc29`. `verify_payment_output_only` is the output check without SPV,
 for a host whose next step verifies the transaction itself; it is opted into by name.
 
 ## Example: Axum server

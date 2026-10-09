@@ -5,10 +5,12 @@
 //! `Unverifiable` with the reason naming the count and the bound, before the
 //! parse; the output-only check is used so no header service is in play.
 
+use async_trait::async_trait;
 use bsv_middleware_rs::{
-    verify_payment_output_only, verify_payment_output_only_with_limits, PaymentToVerify,
-    PaymentVerdict, UnverifiableReason, MAX_PAYMENT_BEEF_BUMPS, MAX_PAYMENT_BEEF_TXS,
-    MAX_PAYMENT_BYTES, PAYMENT_BEEF_LIMITS,
+    verify_payment, verify_payment_output_only, verify_payment_output_only_with_limits,
+    verify_payment_with_limits, HeaderLookupError, HeaderService, PaymentToVerify, PaymentVerdict,
+    UnverifiableReason, MAX_PAYMENT_BEEF_BUMPS, MAX_PAYMENT_BEEF_TXS, MAX_PAYMENT_BYTES,
+    PAYMENT_BEEF_LIMITS,
 };
 use bsv_rs::script::{LockingScript, UnlockingScript};
 use bsv_rs::transaction::{
@@ -305,4 +307,57 @@ fn malformed_atomic_subject_is_still_a_parse_error() {
         PaymentVerdict::Unverifiable(UnverifiableReason::MalformedTransaction(message))
             if message == "Atomic transaction not found"
     ));
+}
+
+/// A header service that must never be asked.
+struct NeverAsked;
+
+#[async_trait]
+impl HeaderService for NeverAsked {
+    async fn merkle_root_at(&self, height: u32) -> Result<String, HeaderLookupError> {
+        panic!("a refusal by a limit asks no header (height {height})");
+    }
+}
+
+#[tokio::test]
+async fn the_full_check_refuses_by_the_same_limits_before_any_lookup() {
+    let headers = NeverAsked;
+    let over_bytes = malformed_atomic(MAX_PAYMENT_BYTES + 1);
+    assert_eq!(
+        verify_payment(&payment(&over_bytes), Some(&headers)).await,
+        refused(UnverifiableReason::PaymentTooLarge {
+            bytes: MAX_PAYMENT_BYTES + 1,
+            max_bytes: MAX_PAYMENT_BYTES,
+        })
+    );
+    let over_txs = chain_atomic(MAX_PAYMENT_BEEF_TXS + 1);
+    assert_eq!(
+        verify_payment(&payment(&over_txs), Some(&headers)).await,
+        refused(UnverifiableReason::BeefTransactionsExceeded {
+            count: MAX_PAYMENT_BEEF_TXS + 1,
+            max_txs: MAX_PAYMENT_BEEF_TXS,
+        })
+    );
+    let over_bumps = funded_atomic(MAX_PAYMENT_BEEF_BUMPS + 1);
+    assert_eq!(
+        verify_payment(&payment(&over_bumps), Some(&headers)).await,
+        refused(UnverifiableReason::BeefBumpsExceeded {
+            count: MAX_PAYMENT_BEEF_BUMPS + 1,
+            max_bumps: MAX_PAYMENT_BEEF_BUMPS,
+        })
+    );
+    let small = chain_atomic(2);
+    assert_eq!(
+        verify_payment_with_limits(&payment(&small), Some(&headers), 40, &PAYMENT_BEEF_LIMITS)
+            .await,
+        refused(UnverifiableReason::PaymentTooLarge {
+            bytes: small.len(),
+            max_bytes: 40,
+        })
+    );
+    // No header service is the server's fault and is answered first.
+    assert_eq!(
+        verify_payment(&payment(&over_bytes), None).await,
+        PaymentVerdict::NoHeaderService
+    );
 }
