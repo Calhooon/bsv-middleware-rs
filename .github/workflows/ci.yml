@@ -1,0 +1,136 @@
+name: ci
+
+# The machine gate. The job ids below are the status-check contexts that branch
+# protection on main requires (test, fmt, clippy, vectors); renaming a job
+# removes its context and blocks every PR until the protection is updated.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  # release.yml runs the same jobs on a tag before it publishes.
+  workflow_call:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Cargo.lock is not tracked (a library), so the key follows the manifest.
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-test-${{ hashFiles('Cargo.toml') }}
+          restore-keys: |
+            ubuntu-test-
+
+      - name: Run the tests
+        run: cargo test --all-features
+
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-clippy-${{ hashFiles('Cargo.toml') }}
+          restore-keys: |
+            ubuntu-clippy-
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  vectors:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-vectors-${{ hashFiles('Cargo.toml') }}
+          restore-keys: |
+            ubuntu-vectors-
+
+      # The 0.3.0 PR extends this job with `cargo test --test conformance_brc29`
+      # (the BRC-29 conformance vectors); until then the payment-bound and
+      # payment tests stand in, so the context name `vectors` is stable.
+      - name: Run the payment-bound tests
+        run: cargo test --test payment_limits
+
+      - name: Run the payment module tests
+        run: cargo test --lib 'payment::'
+
+  # Cloudflare Workers call the payment check, so the crate must build there.
+  wasm32:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-wasm32-${{ hashFiles('Cargo.toml') }}
+          restore-keys: |
+            ubuntu-wasm32-
+
+      - name: Build for wasm32-unknown-unknown
+        run: cargo build --target wasm32-unknown-unknown
