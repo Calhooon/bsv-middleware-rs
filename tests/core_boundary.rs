@@ -20,10 +20,10 @@ fn the_core_module_names_no_runtime_and_nothing_of_this_crate() {
     let uses: Vec<&str> = body.lines().filter(|l| l.starts_with("use ")).collect();
     for line in &uses {
         assert!(
-            ["use async_trait::", "use bsv_rs::"]
+            ["use async_trait::", "use bsv_rs::", "use std::"]
                 .iter()
                 .any(|ok| line.starts_with(ok)),
-            "payment_core imports outside bsv-rs and async-trait: {line}"
+            "payment_core imports outside bsv-rs, async-trait and std: {line}"
         );
     }
     assert!(!uses.is_empty());

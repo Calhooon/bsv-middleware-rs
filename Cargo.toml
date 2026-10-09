@@ -14,8 +14,9 @@ categories = ["authentication", "cryptography", "web-programming"]
 exclude = ["/.github/", "/RELEASING.md", "/CLAUDE.md"]
 
 [dependencies]
-# BSV SDK - provides auth protocol, wallet, key derivation
-bsv-rs = { version = "0.3.35", features = ["auth", "wallet", "transaction"] }
+# BSV SDK - provides auth protocol, wallet, key derivation, and the streaming
+# BEEF reader the payment door reads through (0.4.0: `verify_stream`).
+bsv-rs = { version = "0.4.0", features = ["auth", "wallet", "transaction"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -53,6 +54,8 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
+# A request body that arrives in pieces, for the Axum gate's body transport.
+futures = "0.3"
 
 [[example]]
 name = "axum_server"

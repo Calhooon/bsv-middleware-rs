@@ -9,8 +9,8 @@
 
 use async_trait::async_trait;
 use bsv_middleware_rs::{
-    verify_payment, verify_payment_output_only, HeaderLookupError, HeaderService, PaymentToVerify,
-    PaymentVerdict,
+    verify_payment, verify_payment_output_only, HeaderLookupError, HeaderService, Kind,
+    PaymentToVerify, PaymentVerdict, Reason, UnverifiableReason,
 };
 use bsv_rs::primitives::sha256d;
 use bsv_rs::transaction::{Beef, MerklePath};
@@ -57,28 +57,35 @@ impl HeaderService for Roots {
     }
 }
 
-/// The output check alone.
+const PAYMENT: PaymentToVerify<'static> = PaymentToVerify {
+    output_index: 0,
+    expected_script: SCRIPT,
+    required_satoshis: PRICE,
+};
+
+/// The output check alone. A slice is a source that does not fail.
 fn check(transaction: &[u8]) -> PaymentVerdict {
-    verify_payment_output_only(&PaymentToVerify {
-        transaction,
-        output_index: 0,
-        expected_script: SCRIPT,
-        required_satoshis: PRICE,
-    })
+    verify_payment_output_only(&PAYMENT, transaction).expect("a slice does not fail")
 }
 
 /// The full check against `headers`.
 async fn full(transaction: &[u8], headers: Option<&Roots>) -> PaymentVerdict {
     verify_payment(
-        &PaymentToVerify {
-            transaction,
-            output_index: 0,
-            expected_script: SCRIPT,
-            required_satoshis: PRICE,
-        },
+        &PAYMENT,
+        transaction,
         headers.map(|h| h as &dyn HeaderService),
     )
     .await
+    .expect("a slice does not fail")
+}
+
+/// A refusal of the bytes: the offset and the kind.
+fn invalid(offset: u64, reason: Reason) -> PaymentVerdict {
+    PaymentVerdict::Unverifiable(UnverifiableReason::InvalidBeef {
+        offset,
+        kind: reason.kind(),
+        reason,
+    })
 }
 
 /// The text of a refusal; panics on any other word.
@@ -218,6 +225,7 @@ async fn garbage_over_the_old_byte_bound_is_refused_for_its_bytes_not_its_length
     let mut bytes = vec![0; OLD_MAX_BYTES + 1];
     bytes[..4].copy_from_slice(&[1, 1, 1, 1]);
     let headers = Roots::of(&[]);
+    assert_eq!(check(&bytes), invalid(36, Reason::BadVersion { word: 0 }));
     for text in [
         refusal(check(&bytes), "a zero version word"),
         refusal(full(&bytes, Some(&headers)).await, "a zero version word"),
@@ -270,6 +278,9 @@ async fn a_tree_height_of_65_is_refused_at_its_offset_with_its_kind() {
     assert_eq!(bytes[46], 1);
     bytes[46] = 65;
     let headers = Roots::of(&roots);
+    let refused = invalid(46, Reason::TreeHeightOver64 { height: 65 });
+    assert_eq!(check(&bytes), refused);
+    assert_eq!(full(&bytes, Some(&headers)).await, refused);
     for text in [
         refusal(check(&bytes), "tree height 65"),
         refusal(full(&bytes, Some(&headers)).await, "tree height 65"),
@@ -288,6 +299,9 @@ async fn a_payment_cut_short_is_refused_at_the_field_that_ran_out() {
     let field = bytes.len() - 14;
     bytes.truncate(bytes.len() - 10);
     let headers = Roots::of(&roots);
+    let refused = invalid(field as u64, Reason::Truncated { needed: 8 });
+    assert_eq!(check(&bytes), refused);
+    assert_eq!(full(&bytes, Some(&headers)).await, refused);
     for text in [
         refusal(check(&bytes), "cut short"),
         refusal(full(&bytes, Some(&headers)).await, "cut short"),
@@ -307,6 +321,11 @@ async fn a_claimed_count_is_refused_for_the_bytes_it_does_not_have() {
     let mut bytes = 0xEFBE_0002u32.to_le_bytes().to_vec();
     bytes.extend_from_slice(&[0xFE, 0xFF, 0xFF, 0xFF, 0xFF]);
     let headers = Roots::of(&[]);
+    assert_eq!(check(&bytes), invalid(9, Reason::BadVarint));
+    assert_eq!(
+        full(&bytes, Some(&headers)).await,
+        invalid(9, Reason::BadVarint)
+    );
     for text in [
         refusal(check(&bytes), "a claimed count"),
         refusal(full(&bytes, Some(&headers)).await, "a claimed count"),
@@ -339,8 +358,8 @@ async fn a_root_the_headers_do_not_carry_is_a_mismatch_at_any_size() {
     ));
 }
 
-#[test]
-fn the_output_check_reads_the_declared_atomic_subject() {
+#[tokio::test]
+async fn the_output_check_reads_the_declared_atomic_subject() {
     let (bytes, _) = chain_atomic(3, 0);
     let mut beef = Beef::from_binary(&bytes).expect("honest BEEF");
     let subject = beef.atomic_txid.clone().expect("Atomic subject");
@@ -354,13 +373,26 @@ fn the_output_check_reads_the_declared_atomic_subject() {
     beef.merge_raw_tx(descendant, None);
     let bytes = beef.to_binary_atomic(&subject).expect("Atomic BEEF");
     assert_eq!(check(&bytes), PAID);
+    // The full check holds an Atomic BEEF to the reader's rule: the subject
+    // is the tip of its ancestry. 0.2.2 read past the descendant.
+    let headers = Roots::of(&[(HEIGHT, "00".repeat(32))]);
+    assert_eq!(
+        full(&bytes, Some(&headers)).await,
+        invalid(4, Reason::SubjectMissing { subject: wire })
+    );
+    assert!(headers.asked().is_empty());
 }
 
 #[test]
 fn an_atomic_subject_the_beef_does_not_carry_is_refused() {
     let (mut bytes, _) = chain_atomic(2, 0);
     bytes[4..36].fill(0);
-    assert!(matches!(check(&bytes), PaymentVerdict::Unverifiable(_)));
+    let refused = invalid(4, Reason::SubjectMissing { subject: [0; 32] });
+    assert_eq!(check(&bytes), refused);
+    assert_eq!(
+        Kind::SubjectMissing,
+        Reason::SubjectMissing { subject: [0; 32] }.kind()
+    );
 }
 
 /// The crate's sources name no bound on a payment's bytes or counts.

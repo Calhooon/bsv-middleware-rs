@@ -34,10 +34,10 @@ pub use auth::{sign_message, verify_message_signature, SessionStorage};
 pub use error::{AuthError, Result};
 pub use payment::{payment_headers, PaymentStorage};
 pub use payment_core::{
-    brc29_locking_script, header_service_url, verify_payment, verify_payment_output_only,
-    verify_payment_output_only_with_limits, verify_payment_with_limits, HeaderLookupError,
-    HeaderService, PaymentToVerify, PaymentVerdict, UnverifiableReason, MAX_PAYMENT_BEEF_BUMPS,
-    MAX_PAYMENT_BEEF_TXS, MAX_PAYMENT_BYTES, PAYMENT_BEEF_LIMITS,
+    brc29_locking_script, header_service_url, verify_payment, verify_payment_async,
+    verify_payment_output_only, verify_payment_output_only_async, AsyncByteSource,
+    HeaderLookupError, HeaderService, Kind, PaymentToVerify, PaymentVerdict, Reason, SpendRefusal,
+    UnverifiableReason,
 };
 pub use transport::auth_headers;
 pub use types::{

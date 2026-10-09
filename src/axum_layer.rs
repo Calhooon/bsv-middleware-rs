@@ -26,9 +26,31 @@
 //! The gate does not internalize the payment or claim it against replay: the
 //! handler receives [`VerifiedPayment`] (the transaction, the remittance and
 //! the amount read) and internalizes it with its wallet.
+//!
+//! # A payment of any size: the body transport
+//!
+//! The reference carries the payment in the `x-bsv-payment` header as base64
+//! inside JSON, so the HTTP server's header budget decides how large a
+//! payment can be. This gate reads that transport unchanged, and a second
+//! one for a payment a header cannot carry: the header's JSON names
+//! `derivationPrefix` and `derivationSuffix` and no `transaction`, and the
+//! request body is the BEEF's bytes as they are (no base64, no JSON). The
+//! gate streams the body frame by frame through the verifier
+//! ([`verify_payment_async`]): it never waits for the whole body before it
+//! judges, it stops reading at the soonest invalid byte, and it refuses
+//! nothing for its size or its counts. The 402 challenge names both
+//! transports (`x-bsv-payment-transports: header,body`). The body transport
+//! is this crate's own; the reference at the pin has the header alone.
+//!
+//! The verifier's memory is one element of the BEEF and its index. The gate
+//! itself keeps the bytes it read, because [`VerifiedPayment::transaction`]
+//! hands them to the handler to internalize; the handler's request body is
+//! empty, the body having been the payment.
 
+use std::pin::Pin;
 use std::sync::Arc;
 
+use axum::body::{Body, HttpBody};
 use axum::extract::{FromRequestParts, Request, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderName, HeaderValue, StatusCode};
@@ -38,20 +60,62 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use bsv_rs::primitives::PublicKey;
 use bsv_rs::wallet::ProtoWallet;
+use serde::Deserialize;
 use serde_json::json;
 
 use crate::payment::{
-    build_402_headers, create_derivation_prefix, parse_payment_header, payment_headers,
-    verify_derivation_prefix,
+    build_402_headers, create_derivation_prefix, payment_headers, verify_derivation_prefix,
 };
 use crate::payment_core::{
-    brc29_locking_script, verify_payment, HeaderService, PaymentToVerify, PaymentVerdict,
+    brc29_locking_script, verify_payment, verify_payment_async, AsyncByteSource, HeaderService,
+    PaymentToVerify, PaymentVerdict,
 };
 use crate::types::AuthContext;
 
 /// The output a payment is internalized at: the reference internalizes
 /// output 0 (`index.ts:339`).
 pub const PAYMENT_OUTPUT_INDEX: u32 = 0;
+
+/// The transports the challenge names: the reference's header, and the
+/// request body for a payment a header cannot carry.
+pub const PAYMENT_TRANSPORTS: &str = "header,body";
+
+/// The `x-bsv-payment` header: the remittance, and the transaction when it
+/// travels in the header. Without one, the request body is the transaction.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PaymentHeader {
+    derivation_prefix: String,
+    derivation_suffix: String,
+    #[serde(default)]
+    transaction: Option<String>,
+}
+
+/// The request body as the verifier's byte source, one frame at a time. The
+/// bytes read are kept for the handler.
+struct BodySource {
+    body: Body,
+    read: Vec<u8>,
+}
+
+impl AsyncByteSource for BodySource {
+    async fn next_chunk(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        loop {
+            let frame = std::future::poll_fn(|cx| Pin::new(&mut self.body).poll_frame(cx)).await;
+            match frame {
+                None => return Ok(None),
+                Some(Err(e)) => return Err(std::io::Error::other(e)),
+                // A frame that is not data (trailers) carries no payment byte.
+                Some(Ok(frame)) => {
+                    if let Ok(data) = frame.into_data() {
+                        self.read.extend_from_slice(&data);
+                        return Ok(Some(data.to_vec()));
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// The gate's configuration: the server's wallet (the BRC-29 recipient and the
 /// challenge's HMAC key), the price, and the header service (`None` refuses
@@ -83,7 +147,8 @@ impl PaymentGate {
 pub struct VerifiedPayment {
     /// Satoshis read from the paying output (at least the price).
     pub satoshis_paid: u64,
-    /// The transaction as sent (BEEF bytes), to internalize.
+    /// The transaction as sent (BEEF bytes, from the header or the body), to
+    /// internalize.
     pub transaction: Vec<u8>,
     /// The output that pays ([`PAYMENT_OUTPUT_INDEX`]).
     pub output_index: u32,
@@ -126,7 +191,7 @@ pub async fn require_payment(
     let Some(payment) = header
         .to_str()
         .ok()
-        .and_then(|h| parse_payment_header(h).ok())
+        .and_then(|h| serde_json::from_str::<PaymentHeader>(h).ok())
     else {
         return error(
             StatusCode::BAD_REQUEST,
@@ -141,13 +206,6 @@ pub async fn require_payment(
             "The payment derivation prefix is invalid.",
         );
     }
-    let Ok(transaction) = STANDARD.decode(&payment.transaction) else {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "ERR_INVALID_PAYMENT",
-            "The payment transaction is not base64.",
-        );
-    };
     let expected_script = match brc29_locking_script(
         &gate.wallet,
         &payment.derivation_prefix,
@@ -163,16 +221,45 @@ pub async fn require_payment(
             )
         }
     };
-    let verdict = verify_payment(
-        &PaymentToVerify {
-            transaction: &transaction,
-            output_index: PAYMENT_OUTPUT_INDEX,
-            expected_script: &expected_script,
-            required_satoshis: gate.satoshis_required,
-        },
-        gate.header_service.as_deref(),
-    )
-    .await;
+    let to_verify = PaymentToVerify {
+        output_index: PAYMENT_OUTPUT_INDEX,
+        expected_script: &expected_script,
+        required_satoshis: gate.satoshis_required,
+    };
+    let headers = gate.header_service.as_deref();
+    let (read, transaction) = match &payment.transaction {
+        // The reference's transport: the transaction in the header.
+        Some(encoded) => {
+            let Ok(transaction) = STANDARD.decode(encoded) else {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "ERR_INVALID_PAYMENT",
+                    "The payment transaction is not base64.",
+                );
+            };
+            let read = verify_payment(&to_verify, &transaction[..], headers).await;
+            (read, transaction)
+        }
+        // The body transport: the body is the transaction, streamed.
+        None => {
+            let (parts, body) = request.into_parts();
+            let mut source = BodySource {
+                body,
+                read: Vec::new(),
+            };
+            let read = verify_payment_async(&to_verify, &mut source, headers).await;
+            request = Request::from_parts(parts, Body::empty());
+            (read, source.read)
+        }
+    };
+    // The source failed (a body cut off in flight): no verdict on the payment.
+    let Ok(verdict) = read else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "ERR_INVALID_PAYMENT",
+            "The payment body could not be read.",
+        );
+    };
     // The six words to HTTP, in one match.
     let description = verdict.to_string();
     let satoshis_paid = match verdict {
@@ -242,6 +329,10 @@ fn challenge(gate: &PaymentGate, code: &str, description: &str) -> Response {
             response.headers_mut().insert(name, value);
         }
     }
+    response.headers_mut().insert(
+        HeaderName::from_static(payment_headers::TRANSPORTS),
+        HeaderValue::from_static(PAYMENT_TRANSPORTS),
+    );
     response
 }
 

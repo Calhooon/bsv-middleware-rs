@@ -3,72 +3,72 @@
 //! This module is the API `bsv-middleware-core` is to provide (bsv-stack-lean
 //! #50; epoch `NETWORK-ENFORCEMENT-RULES.md` Rule 27 at 2f4ef72). It names no
 //! axum, tokio, reqwest or worker type and nothing else in this crate: it uses
-//! `bsv-rs` (BEEF, keys), `async-trait` and `hex` only, so when the core crate
-//! is published the module is replaced by a re-export of it and the Axum layer
-//! above (`crate::axum`) is unchanged.
+//! `bsv-rs` (the streaming BEEF reader, keys), `async-trait` and `std` only,
+//! so when the core crate is published the module is replaced by a re-export
+//! of it and the Axum layer above (`crate::axum_layer`) is unchanged.
 //!
 //! The verdict is a word, never a boolean ([`PaymentVerdict`]); the header
 //! service is a trait ([`HeaderService`]) passed as an `Option`, and `None` is
 //! [`PaymentVerdict::NoHeaderService`] before any other check. The rule is
-//! pinned by `tests/vectors/brc29-payment-vectors.json` (20 cases, a
+//! pinned by `tests/vectors/brc29-payment-vectors.json` (22 cases, a
 //! byte-pinned copy of the canonical file the stack review repository owns),
 //! run in `tests/conformance_brc29.rs`.
 //!
-//! Order of checks (the canonical `conformance/README.md`, "Order of checks"):
-//! 1. a header service is configured, else `NoHeaderService`;
-//! 2. the payment is within its byte budget ([`MAX_PAYMENT_BYTES`]) and, for
-//!    a BEEF, its transaction and BUMP counts are within theirs
-//!    ([`PAYMENT_BEEF_LIMITS`]), each checked before the entries are read,
-//!    else `Unverifiable` naming the count and the bound; then the payment
-//!    parses (BEEF V1/V2 or Atomic BEEF; the subject is the
-//!    Atomic BEEF's named transaction, else the last), and output
-//!    `output_index` exists and carries an amount, else `Unverifiable`;
-//! 3. the output's script equals the expected BRC-29 script, else
-//!    `WrongScript`; then its satoshis are at least the price, else
-//!    `Underpaid`;
-//! 4. the BEEF is structurally complete, else `Unverifiable`; every merkle
-//!    root it computes, lowest height first, is the header service's root at
-//!    that height (case-insensitive hex): a different root is `RootMismatch`,
-//!    a lookup that cannot answer is `Unverifiable` (fail closed; a mismatch
-//!    at any height still wins over an outage at another);
-//! 5. `Verified { satoshis }`, the amount read from the output.
+//! # A payment of any size
+//!
+//! A valid payment is never refused for its size or its counts (the ruling
+//! of 2026-10-09; bsv-stack-lean `docs/charters/beef-of-any-size.md`). The
+//! payment is a byte source, read once through the streaming reader of bsv-rs
+//! 0.4.0 ([`bsv_rs::transaction::verify_stream`]): one element of the BEEF in
+//! hand and the reader's index, never the BEEF. A refusal of the bytes names
+//! the offset and one of the reader's eighteen kinds
+//! ([`UnverifiableReason::InvalidBeef`]), none of which is a size or a count.
+//! This module carries no bound and exports none.
+//!
+//! Order of checks:
+//! 1. a header service is configured, else `NoHeaderService`, before the
+//!    source is read;
+//! 2. the source is a valid BEEF (V1, V2 or Atomic) by the streaming reader:
+//!    the frame, every BUMP's own root, every unproven transaction's inputs
+//!    naming earlier transactions and spending them (the scripts run), the
+//!    Atomic subject the tip of its ancestry; else `Unverifiable`, at the
+//!    soonest fault in stream order;
+//! 3. the subject (the Atomic BEEF's named transaction, else the last raw
+//!    transaction) has output `output_index`, else `Unverifiable`; the
+//!    output's script equals the expected BRC-29 script, else `WrongScript`;
+//!    its satoshis are at least the price, else `Underpaid`;
+//! 4. the BEEF carries a proof and every unproven transaction has an input
+//!    (so every ancestry ends at a proven transaction), else `Unverifiable`;
+//! 5. every merkle root the BUMPs compute, lowest height first, is the header
+//!    service's root at that height (case-insensitive hex): a different root
+//!    is `RootMismatch`, a lookup that cannot answer is `Unverifiable` (fail
+//!    closed; a mismatch at any height still wins over an outage at another);
+//! 6. `Verified { satoshis }`, the amount read from the output.
+//!
+//! The roots are asked after the output is judged (no header is asked for a
+//! payment the output already refuses), so the reader runs with every root
+//! granted and step 5 is where a root is held to a header: nothing is
+//! `Verified` with a root unchecked.
 
 use async_trait::async_trait;
 use bsv_rs::primitives::PublicKey;
-use bsv_rs::transaction::{Beef, BeefLimits, Transaction, ATOMIC_BEEF, BEEF_V1, BEEF_V2};
+use bsv_rs::transaction::beef_stream::{display_hex, Hash32, Step, TxBody};
+use bsv_rs::transaction::{
+    verify_stream, verify_stream_async, AlwaysValidChainTracker, BeefDecoder, Element, Refusal,
+    Transaction, Verdict, ATOMIC_BEEF, BEEF_V1, BEEF_V2,
+};
 use bsv_rs::wallet::{Counterparty, GetPublicKeyArgs, ProtoWallet, Protocol, SecurityLevel};
+use std::io::Read;
+
+pub use bsv_rs::transaction::beef_stream::SpendRefusal;
+pub use bsv_rs::transaction::{AsyncByteSource, Kind, Reason};
 
 /// The BRC-29 payment protocol name (security level 2), the protocol the
 /// payer derives the paying key under.
 pub const BRC29_PROTOCOL_NAME: &str = "3241645161d8";
 
-/// Maximum decoded payment size: 4 MiB, matching the message box's standard
-/// body budget (`ts-stack@fb1b2da infra/message-box-server/src/app.ts:195-208`).
-/// The reference middleware uses a base64 JSON `x-bsv-payment` header with no
-/// code size cap (`payment-express-middleware/src/index.ts:67-107`); Node's
-/// default HTTP header budget is 16 KiB. The larger shared bound also serves
-/// body callers and accommodates the known 1.9 MB ancestor (Zanaadu #357).
-/// Callers must bound their transport before reading or decoding the payment.
-pub const MAX_PAYMENT_BYTES: usize = 4 * 1024 * 1024;
-
-/// Maximum payment BEEF transactions: room for the subject and 127 ancestors
-/// through its proven funding roots. This is a door policy with headroom for
-/// branching unproven funding, not a limit on valid chain transactions. A
-/// large proven ancestor (Zanaadu #357) needs bytes, not thousands of entries.
-pub const MAX_PAYMENT_BEEF_TXS: usize = 128;
-
-/// Maximum payment BUMPs: 32 distinct proof blocks allow consolidated funding
-/// within the 128-transaction budget. A BUMP may prove several ancestors;
-/// this counts proof blocks, not leaves. The byte bound and the SDK's bounded
-/// parser also apply. Callers with a different policy can supply their limits.
-pub const MAX_PAYMENT_BEEF_BUMPS: usize = 32;
-
-/// Default bounds for the shared payment door, including the Atomic prefix.
-pub const PAYMENT_BEEF_LIMITS: BeefLimits = BeefLimits {
-    max_txs: MAX_PAYMENT_BEEF_TXS,
-    max_bumps: MAX_PAYMENT_BEEF_BUMPS,
-    max_bytes: MAX_PAYMENT_BYTES,
-};
+/// The bytes read from a source at a time by the output-only check.
+const CHUNK: usize = 16 * 1024;
 
 /// What a payment verifier answers: six words, never a boolean.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,35 +111,44 @@ pub enum PaymentVerdict {
 
 /// Why a payment is [`PaymentVerdict::Unverifiable`].
 ///
+/// No reason is a size or a count: a payment is refused for what its bytes
+/// say, never for how many they are.
+///
 /// Non-exhaustive: a reason may be added in a minor release, so a match on
 /// it carries a catch-all arm. The six words of [`PaymentVerdict`] are the
 /// contract and stay exhaustive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum UnverifiableReason {
-    /// The payment exceeds its byte budget, checked before parsing.
-    PaymentTooLarge {
-        /// The complete serialized payment length.
-        bytes: usize,
-        /// The byte budget that was exceeded.
-        max_bytes: usize,
+    /// The BEEF's bytes are invalid: the offset of the byte and one of the
+    /// streaming reader's eighteen kinds (bsv-rs 0.4.0, the Lean definition
+    /// `BeefOfAnySize`). The reading stopped there.
+    InvalidBeef {
+        /// The stream offset of the byte the refusal names.
+        offset: u64,
+        /// The kind.
+        kind: Kind,
+        /// The kind with its data.
+        reason: Reason,
     },
-    /// The BEEF transaction count prefix exceeds the door's budget.
-    BeefTransactionsExceeded {
-        /// The count claimed by the BEEF.
-        count: usize,
-        /// The maximum transaction count.
-        max_txs: usize,
+    /// The BEEF's bytes are well formed up to `offset` and the script
+    /// interpreter refused a spend of an unproven transaction.
+    SpendRefused {
+        /// The offset of the input (or of the transaction, for the value
+        /// rule).
+        offset: u64,
+        /// The spending transaction (display hex).
+        txid: String,
+        /// The input, when one input is named.
+        input: Option<u32>,
+        /// Why.
+        why: SpendRefusal,
     },
-    /// The BEEF BUMP count prefix exceeds the door's budget.
-    BeefBumpsExceeded {
-        /// The count claimed by the BEEF.
-        count: usize,
-        /// The maximum BUMP count.
-        max_bumps: usize,
-    },
-    /// The bytes are neither a BEEF nor a raw transaction.
+    /// The bytes are not a BEEF and not a raw transaction (the output-only
+    /// check, which reads a raw transaction).
     MalformedTransaction(String),
+    /// The BEEF carries no raw transaction: nothing pays.
+    NoTransaction,
     /// The subject transaction has no output at the index that is paid.
     OutputMissing {
         /// The index the payment names.
@@ -147,16 +156,12 @@ pub enum UnverifiableReason {
         /// How many outputs the transaction has.
         output_count: usize,
     },
-    /// The output carries no amount.
-    OutputWithoutAmount,
     /// The derivation inputs do not name a key (the sender identity is not a
     /// public key).
     KeyDerivation(String),
-    /// A raw transaction carries no merkle proof to check against headers.
+    /// The BEEF is valid and gives no root to check: it carries no BUMP, or
+    /// an unproven transaction has no input, so nothing beneath it is proven.
     NoProof,
-    /// The BEEF is not structurally complete: missing inputs, txid-only gaps,
-    /// or a proof chain that does not verify.
-    IncompleteBeef,
     /// The header service could not answer for `height` (outage, timeout,
     /// height not indexed). The server's side, not the payer's.
     HeaderLookupFailed {
@@ -171,6 +176,14 @@ impl UnverifiableReason {
     /// True when the server, not the payment, is why it cannot be verified.
     pub fn is_server_side(&self) -> bool {
         matches!(self, Self::HeaderLookupFailed { .. })
+    }
+
+    fn invalid(refusal: Refusal) -> Self {
+        Self::InvalidBeef {
+            offset: refusal.offset,
+            kind: refusal.reason.kind(),
+            reason: refusal.reason,
+        }
     }
 }
 
@@ -210,22 +223,23 @@ impl std::fmt::Display for PaymentVerdict {
 impl std::fmt::Display for UnverifiableReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::PaymentTooLarge { bytes, max_bytes } => write!(
-                f,
-                "payment transaction is {} bytes, over max_bytes {}",
-                bytes, max_bytes
-            ),
-            Self::BeefTransactionsExceeded { count, max_txs } => write!(
-                f,
-                "payment BEEF claims {} transactions, over max_txs {}",
-                count, max_txs
-            ),
-            Self::BeefBumpsExceeded { count, max_bumps } => write!(
-                f,
-                "payment BEEF claims {} BUMPs, over max_bumps {}",
-                count, max_bumps
-            ),
+            Self::InvalidBeef { offset, kind, .. } => {
+                write!(f, "BEEF is invalid at offset {}: {:?}", offset, kind)
+            }
+            Self::SpendRefused {
+                offset,
+                txid,
+                input,
+                why,
+            } => {
+                write!(f, "transaction {} at offset {} ", txid, offset)?;
+                if let Some(input) = input {
+                    write!(f, "input {} ", input)?;
+                }
+                write!(f, "does not spend: {:?}", why)
+            }
             Self::MalformedTransaction(e) => write!(f, "transaction is malformed: {}", e),
+            Self::NoTransaction => write!(f, "BEEF carries no raw transaction"),
             Self::OutputMissing {
                 output_index,
                 output_count,
@@ -234,12 +248,10 @@ impl std::fmt::Display for UnverifiableReason {
                 "output {} is missing (transaction has {} outputs)",
                 output_index, output_count
             ),
-            Self::OutputWithoutAmount => write!(f, "output carries no amount"),
             Self::KeyDerivation(e) => write!(f, "key derivation failed: {}", e),
-            Self::NoProof => write!(f, "a raw transaction carries no merkle proof"),
-            Self::IncompleteBeef => write!(
+            Self::NoProof => write!(
                 f,
-                "BEEF is incomplete (missing inputs, txid-only gaps, or a broken proof chain)"
+                "BEEF gives no merkle root to check (no BUMP, or an unproven transaction with no input)"
             ),
             Self::HeaderLookupFailed { height, reason } => {
                 write!(
@@ -268,13 +280,11 @@ pub trait HeaderService: Send + Sync {
     async fn merkle_root_at(&self, height: u32) -> Result<String, HeaderLookupError>;
 }
 
-/// One payment to verify: the transaction as sent, the output that is paid,
-/// the script it must carry ([`brc29_locking_script`]) and the price.
+/// One payment to verify: the output that is paid, the script it must carry
+/// ([`brc29_locking_script`]) and the price. The transaction is the byte
+/// source handed to the verifier beside it.
 #[derive(Debug, Clone, Copy)]
 pub struct PaymentToVerify<'a> {
-    /// A BEEF (V1, V2 or Atomic) or, for [`verify_payment_output_only`], a raw
-    /// transaction.
-    pub transaction: &'a [u8],
     /// The output that is internalized (the reference uses 0).
     pub output_index: u32,
     /// The P2PKH script the server derived for this payment.
@@ -318,209 +328,438 @@ pub fn brc29_locking_script(
     Ok(script)
 }
 
-/// The full check: header service, output, BEEF structure, merkle roots.
+/// The full check of a payment read from `transaction`: header service, the
+/// BEEF by the streaming reader, the output, the merkle roots.
+///
+/// `transaction` is any [`Read`] positioned at the BEEF's leading byte: a
+/// slice (`&bytes[..]`), a file, a decoder over a transport. It is read once,
+/// through [`verify_stream`]; the verifier holds one element of the BEEF and
+/// the reader's index, and refuses nothing for its size or its counts. For a
+/// body that arrives in chunks use [`verify_payment_async`].
 ///
 /// `header_service` is `None` when the deployment has none: the answer is
-/// [`PaymentVerdict::NoHeaderService`] before the payment is read.
+/// [`PaymentVerdict::NoHeaderService`] before the source is read.
 ///
-/// Payments over [`MAX_PAYMENT_BYTES`] are refused before parsing and BEEF
-/// counts are bounded by [`PAYMENT_BEEF_LIMITS`]. Use
-/// [`verify_payment_with_limits`] for a caller's own budgets.
-pub async fn verify_payment(
+/// The source is read inside this future, before the first header is asked:
+/// a `Read` that blocks holds the task while it does.
+///
+/// `Err` is the source's failure. It says nothing about the payment and is
+/// never an acceptance.
+pub async fn verify_payment<R: Read>(
     payment: &PaymentToVerify<'_>,
+    transaction: R,
     header_service: Option<&dyn HeaderService>,
-) -> PaymentVerdict {
-    verify_payment_with_limits(
-        payment,
-        header_service,
-        MAX_PAYMENT_BYTES,
-        &PAYMENT_BEEF_LIMITS,
-    )
-    .await
+) -> std::io::Result<PaymentVerdict> {
+    let Some(headers) = header_service else {
+        return Ok(PaymentVerdict::NoHeaderService);
+    };
+    let mut tap = Tap::new(payment);
+    let source = Tee {
+        source: transaction,
+        tap: &mut tap,
+    };
+    let verdict = verify_stream(source, RootsAskedAfter, None)?;
+    Ok(tap.conclude(verdict, headers).await)
 }
 
-/// [`verify_payment`] with caller-supplied byte and BEEF budgets.
-///
-/// `max_bytes` bounds every format before parsing; `beef_limits.max_bytes`
-/// additionally bounds a BEEF, so the smaller byte budget wins there. BEEF
-/// count prefixes are checked before their entries are read
-/// (`Beef::from_binary_with_limits`, bsv-rs 0.3.35). The caller must also
-/// bound transport reads and decoding before this call.
-pub async fn verify_payment_with_limits(
+/// [`verify_payment`] over a source that yields its chunks asynchronously
+/// ([`AsyncByteSource`], the trait bsv-rs 0.4.0 ships): a request body, an
+/// object store's body stream. The same order of checks and the same
+/// verdicts, through [`verify_stream_async`].
+pub async fn verify_payment_async<S: AsyncByteSource>(
     payment: &PaymentToVerify<'_>,
+    transaction: &mut S,
     header_service: Option<&dyn HeaderService>,
-    max_bytes: usize,
-    beef_limits: &BeefLimits,
-) -> PaymentVerdict {
+) -> std::io::Result<PaymentVerdict> {
     let Some(headers) = header_service else {
-        return PaymentVerdict::NoHeaderService;
+        return Ok(PaymentVerdict::NoHeaderService);
     };
-    let (transaction, beef) = match read_payment(payment.transaction, max_bytes, beef_limits) {
-        Ok(read) => read,
-        Err(reason) => return PaymentVerdict::Unverifiable(reason),
+    let mut tap = Tap::new(payment);
+    let mut source = AsyncTee {
+        source: transaction,
+        tap: &mut tap,
     };
-    let satoshis = match check_output(&transaction, payment) {
-        Ok(satoshis) => satoshis,
-        Err(verdict) => return verdict,
+    let granted = AlwaysValidChainTracker::new(0);
+    let verdict = verify_stream_async(&mut source, &granted, None)
+        .await
+        .map_err(|e| match e {
+            bsv_rs::transaction::beef_stream::AsyncVerifyError::Source(e) => e,
+            other => std::io::Error::other(other.to_string()),
+        })?;
+    Ok(tap.conclude(verdict, headers).await)
+}
+
+/// The output check alone: no header service, no BEEF structure, no spends,
+/// no merkle roots. Opted into by name (Rule 27) by a host whose next step
+/// checks the transaction itself (a storage that verifies the BEEF before it
+/// records it); it never answers `NoHeaderService` or `RootMismatch`.
+///
+/// A BEEF is cut into its elements as it is read, one in hand and no index;
+/// its frame must be whole, and the subject is the Atomic BEEF's named
+/// transaction, else the last raw transaction. A source that does not lead
+/// with a BEEF version word is read to its end as one raw transaction.
+/// Nothing is refused for its size or its counts.
+///
+/// `Err` is the source's failure and says nothing about the payment.
+pub fn verify_payment_output_only<R: Read>(
+    payment: &PaymentToVerify<'_>,
+    mut transaction: R,
+) -> std::io::Result<PaymentVerdict> {
+    let mut read = |buf: &mut [u8]| loop {
+        match transaction.read(buf) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            other => return other,
+        }
     };
-    let Some(mut beef) = beef else {
-        return PaymentVerdict::Unverifiable(UnverifiableReason::NoProof);
-    };
-    let validation = beef.verify_valid(false);
-    if !validation.valid {
-        return PaymentVerdict::Unverifiable(UnverifiableReason::IncompleteBeef);
+    let mut lead = [0u8; 4];
+    let mut have = 0;
+    while have < lead.len() {
+        match read(&mut lead[have..])? {
+            0 => break,
+            n => have += n,
+        }
     }
-    if validation.roots.is_empty() {
-        return PaymentVerdict::Unverifiable(UnverifiableReason::NoProof);
+    let mut chunk = vec![0u8; CHUNK].into_boxed_slice();
+    if !leads_with_beef(&lead[..have]) {
+        let mut raw = lead[..have].to_vec();
+        loop {
+            match read(&mut chunk)? {
+                0 => return Ok(raw_transaction_output(payment, &raw)),
+                n => raw.extend_from_slice(&chunk[..n]),
+            }
+        }
     }
-    let mut roots: Vec<(u32, String)> = validation.roots.into_iter().collect();
-    roots.sort_unstable();
-    let mut first_failure = None;
-    for (height, root) in roots {
-        match headers.merkle_root_at(height).await {
-            Ok(header_root) if header_root.eq_ignore_ascii_case(&root) => {}
-            Ok(_) => {
-                return PaymentVerdict::RootMismatch {
-                    height,
-                    merkle_root: root,
+    let mut tap = Tap::new(payment);
+    tap.feed(&lead);
+    while tap.refusal.is_none() {
+        match read(&mut chunk)? {
+            0 => break,
+            n => tap.feed(&chunk[..n]),
+        }
+    }
+    Ok(tap.output_only())
+}
+
+/// [`verify_payment_output_only`] over an [`AsyncByteSource`].
+pub async fn verify_payment_output_only_async<S: AsyncByteSource>(
+    payment: &PaymentToVerify<'_>,
+    transaction: &mut S,
+) -> std::io::Result<PaymentVerdict> {
+    let mut lead = Vec::new();
+    let mut ended = false;
+    while lead.len() < 4 && !ended {
+        match transaction.next_chunk().await? {
+            Some(chunk) => lead.extend_from_slice(&chunk),
+            None => ended = true,
+        }
+    }
+    if !leads_with_beef(&lead) {
+        while let Some(chunk) = transaction.next_chunk().await? {
+            lead.extend_from_slice(&chunk);
+        }
+        return Ok(raw_transaction_output(payment, &lead));
+    }
+    let mut tap = Tap::new(payment);
+    tap.feed(&lead);
+    drop(lead);
+    while tap.refusal.is_none() {
+        match transaction.next_chunk().await? {
+            Some(chunk) => tap.feed(&chunk),
+            None => break,
+        }
+    }
+    Ok(tap.output_only())
+}
+
+/// The bytes lead with a BEEF version word (V1, V2 or the Atomic prefix).
+fn leads_with_beef(lead: &[u8]) -> bool {
+    matches!(
+        lead.get(..4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+        Some(ATOMIC_BEEF | BEEF_V1 | BEEF_V2)
+    )
+}
+
+/// The reader's headers while the BEEF streams: every root is granted here
+/// and held to the header service afterwards, lowest height first, once the
+/// output is judged ([`Tap::conclude`]). The reader's verdict hands the roots
+/// back; none is accepted unasked.
+struct RootsAskedAfter;
+
+impl bsv_rs::transaction::Headers for RootsAskedAfter {
+    fn carries(&self, _height: u64, _root: &Hash32) -> bool {
+        true
+    }
+}
+
+/// What the door notes of the bytes as they pass to the reader: the subject's
+/// output, judged. One element in hand, nothing kept of the others.
+struct Tap<'p> {
+    payment: &'p PaymentToVerify<'p>,
+    decoder: BeefDecoder,
+    /// The frame's own fault, where the cutting stopped.
+    refusal: Option<Refusal>,
+    /// The output check of the subject: the Atomic BEEF's named transaction,
+    /// else the last raw transaction read so far.
+    paid: Option<Result<u64, PaymentVerdict>>,
+    /// An unproven transaction with no input was read: nothing beneath it is
+    /// proven, and the reader's structure rule has no input to hold it by.
+    unanchored: bool,
+    /// A BUMP claims a height no header service can be asked for.
+    beyond_headers: Option<Refusal>,
+}
+
+impl<'p> Tap<'p> {
+    fn new(payment: &'p PaymentToVerify<'p>) -> Self {
+        Self {
+            payment,
+            decoder: BeefDecoder::new(),
+            refusal: None,
+            paid: None,
+            unanchored: false,
+            beyond_headers: None,
+        }
+    }
+
+    /// The next bytes of the source.
+    fn feed(&mut self, mut input: &[u8]) {
+        if self.refusal.is_some() {
+            return;
+        }
+        loop {
+            match self.decoder.next(&mut input) {
+                Ok(Step::Element(element)) => self.note(&element),
+                Ok(Step::NeedMore | Step::Done) => return,
+                Err(refusal) => {
+                    self.refusal = Some(refusal);
+                    return;
                 }
             }
-            Err(HeaderLookupError(reason)) => {
-                first_failure
-                    .get_or_insert(UnverifiableReason::HeaderLookupFailed { height, reason });
+        }
+    }
+
+    fn note(&mut self, element: &Element) {
+        match element {
+            Element::Bump(bump) => {
+                if bump.block_height > u64::from(u32::MAX) && self.beyond_headers.is_none() {
+                    self.beyond_headers = Some(Refusal {
+                        offset: bump.offset,
+                        reason: Reason::RootNotCarried {
+                            height: bump.block_height,
+                            root: bump.root,
+                        },
+                    });
+                }
             }
+            Element::Tx {
+                txid,
+                bump_index,
+                body,
+                ..
+            } => {
+                if bump_index.is_none() && body.inputs.is_empty() {
+                    self.unanchored = true;
+                }
+                let subject = match self.decoder.subject() {
+                    Some(named) => named == *txid && self.paid.is_none(),
+                    None => true,
+                };
+                if subject {
+                    self.paid = Some(streamed_output(self.payment, body));
+                }
+            }
+            Element::TxidOnly { .. } => {}
         }
     }
-    match first_failure {
-        Some(reason) => PaymentVerdict::Unverifiable(reason),
-        None => PaymentVerdict::Verified { satoshis },
-    }
-}
 
-/// The output check alone: no header service, no BEEF structure, no merkle
-/// roots. Opted into by name (Rule 27) by a host whose next step checks the
-/// transaction itself (a storage that verifies the BEEF before it records
-/// it); it never answers `NoHeaderService` or `RootMismatch`. Reads a raw
-/// transaction as well as a BEEF.
-///
-/// Payments over [`MAX_PAYMENT_BYTES`] are refused before parsing and BEEF
-/// counts are bounded by [`PAYMENT_BEEF_LIMITS`]. Use
-/// [`verify_payment_output_only_with_limits`] for a caller's own budgets.
-pub fn verify_payment_output_only(payment: &PaymentToVerify<'_>) -> PaymentVerdict {
-    verify_payment_output_only_with_limits(payment, MAX_PAYMENT_BYTES, &PAYMENT_BEEF_LIMITS)
-}
-
-/// [`verify_payment_output_only`] with caller-supplied byte and BEEF budgets
-/// (see [`verify_payment_with_limits`]). A raw transaction is bounded by
-/// `max_bytes` alone.
-pub fn verify_payment_output_only_with_limits(
-    payment: &PaymentToVerify<'_>,
-    max_bytes: usize,
-    beef_limits: &BeefLimits,
-) -> PaymentVerdict {
-    match read_payment(payment.transaction, max_bytes, beef_limits) {
-        Err(reason) => PaymentVerdict::Unverifiable(reason),
-        Ok((transaction, _)) => match check_output(&transaction, payment) {
-            Ok(satoshis) => PaymentVerdict::Verified { satoshis },
-            Err(verdict) => verdict,
-        },
-    }
-}
-
-/// The subject transaction and, when the bytes are a BEEF, the BEEF.
-///
-/// The byte budget is checked before either format is parsed and the BEEF
-/// counts before their entries are read; the BEEF is parsed once and the
-/// subject taken from it (the Atomic BEEF's named transaction, else the
-/// last), the resolution order of `Transaction::from_beef` in bsv-rs 0.3.35.
-fn read_payment(
-    bytes: &[u8],
-    max_bytes: usize,
-    beef_limits: &BeefLimits,
-) -> Result<(Transaction, Option<Beef>), UnverifiableReason> {
-    if bytes.len() > max_bytes {
-        return Err(UnverifiableReason::PaymentTooLarge {
-            bytes: bytes.len(),
-            max_bytes,
-        });
-    }
-    let malformed = |e: bsv_rs::Error| UnverifiableReason::MalformedTransaction(e.to_string());
-    let magic = bytes
-        .get(..4)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
-    if matches!(magic, Some(ATOMIC_BEEF | BEEF_V1 | BEEF_V2)) {
-        if bytes.len() > beef_limits.max_bytes {
-            return Err(UnverifiableReason::PaymentTooLarge {
-                bytes: bytes.len(),
-                max_bytes: beef_limits.max_bytes,
-            });
-        }
-        let beef = Beef::from_binary_with_limits(bytes, beef_limits).map_err(bounded_beef_error)?;
-        let not_found = |what: &str| UnverifiableReason::MalformedTransaction(what.to_string());
-        let transaction = match beef.atomic_txid.as_deref() {
-            Some(txid) => beef
-                .find_atomic_transaction(txid)
-                .ok_or_else(|| not_found("Atomic transaction not found"))?,
-            None => {
-                let txid = beef
-                    .txs
-                    .last()
-                    .map(|tx| tx.txid())
-                    .ok_or_else(|| not_found("No transactions in BEEF"))?;
-                beef.find_atomic_transaction(&txid)
-                    .ok_or_else(|| not_found("Subject transaction not found in BEEF"))?
+    /// The six words over the reader's verdict.
+    async fn conclude(self, verdict: Verdict, headers: &dyn HeaderService) -> PaymentVerdict {
+        let Tap {
+            paid,
+            unanchored,
+            beyond_headers,
+            ..
+        } = self;
+        let roots = match verdict {
+            Verdict::Valid { roots, .. } => roots,
+            Verdict::Invalid {
+                offset,
+                kind,
+                reason,
+            } => {
+                return PaymentVerdict::Unverifiable(UnverifiableReason::InvalidBeef {
+                    offset,
+                    kind,
+                    reason,
+                })
+            }
+            Verdict::SpendRefused {
+                offset,
+                txid,
+                input,
+                why,
+            } => {
+                return PaymentVerdict::Unverifiable(UnverifiableReason::SpendRefused {
+                    offset,
+                    txid: display_hex(&txid),
+                    input,
+                    why,
+                })
             }
         };
-        Ok((transaction, Some(beef)))
-    } else {
-        Ok((Transaction::from_binary(bytes).map_err(malformed)?, None))
+        let satoshis = match paid {
+            None => return PaymentVerdict::Unverifiable(UnverifiableReason::NoTransaction),
+            Some(Err(verdict)) => return verdict,
+            Some(Ok(satoshis)) => satoshis,
+        };
+        if unanchored || roots.is_empty() {
+            return PaymentVerdict::Unverifiable(UnverifiableReason::NoProof);
+        }
+        if let Some(refusal) = beyond_headers {
+            return PaymentVerdict::Unverifiable(UnverifiableReason::invalid(refusal));
+        }
+        // Each distinct root once, lowest height first. Two BUMPs that claim
+        // one height with two roots are two questions, and one is a mismatch.
+        let mut roots: Vec<(u32, String)> = roots
+            .iter()
+            .map(|(height, root)| (*height as u32, display_hex(root)))
+            .collect();
+        roots.sort_unstable();
+        roots.dedup();
+        let mut first_failure = None;
+        for (height, root) in roots {
+            match headers.merkle_root_at(height).await {
+                Ok(header_root) if header_root.eq_ignore_ascii_case(&root) => {}
+                Ok(_) => {
+                    return PaymentVerdict::RootMismatch {
+                        height,
+                        merkle_root: root,
+                    }
+                }
+                Err(HeaderLookupError(reason)) => {
+                    first_failure
+                        .get_or_insert(UnverifiableReason::HeaderLookupFailed { height, reason });
+                }
+            }
+        }
+        match first_failure {
+            Some(reason) => PaymentVerdict::Unverifiable(reason),
+            None => PaymentVerdict::Verified { satoshis },
+        }
+    }
+
+    /// The output check alone, at the source's end: the frame was whole and
+    /// the subject's output pays.
+    fn output_only(mut self) -> PaymentVerdict {
+        let refusal = match self.refusal.take() {
+            Some(refusal) => Some(refusal),
+            None => self.decoder.finish().err(),
+        };
+        if let Some(refusal) = refusal {
+            return PaymentVerdict::Unverifiable(UnverifiableReason::invalid(refusal));
+        }
+        match (self.paid, self.decoder.subject()) {
+            (Some(Ok(satoshis)), _) => PaymentVerdict::Verified { satoshis },
+            (Some(Err(verdict)), _) => verdict,
+            // The reader's own word for an Atomic subject the BEEF does not
+            // carry, at the prefix's 32 bytes.
+            (None, Some(subject)) => {
+                PaymentVerdict::Unverifiable(UnverifiableReason::invalid(Refusal {
+                    offset: 4,
+                    reason: Reason::SubjectMissing { subject },
+                }))
+            }
+            (None, None) => PaymentVerdict::Unverifiable(UnverifiableReason::NoTransaction),
+        }
     }
 }
 
-// bsv-rs 0.3.35 exposes limit diagnostics as BeefError(String). Translate its
-// exact count diagnostics; other parser errors retain the malformed reason.
-fn bounded_beef_error(error: bsv_rs::Error) -> UnverifiableReason {
-    if let bsv_rs::Error::BeefError(message) = &error {
-        if let Some((count, max_txs)) = beef_limit_counts(message, " transactions, over max_txs ") {
-            return UnverifiableReason::BeefTransactionsExceeded { count, max_txs };
-        }
-        if let Some((count, max_bumps)) = beef_limit_counts(message, " BUMPs, over max_bumps ") {
-            return UnverifiableReason::BeefBumpsExceeded { count, max_bumps };
-        }
-    }
-    UnverifiableReason::MalformedTransaction(error.to_string())
+/// The source, with each chunk the reader takes shown to the tap.
+struct Tee<'t, 'p, R> {
+    source: R,
+    tap: &'t mut Tap<'p>,
 }
 
-fn beef_limit_counts(message: &str, separator: &str) -> Option<(usize, usize)> {
-    let claimed = message.strip_prefix("BEEF claims ")?;
-    let (count, bound) = claimed.split_once(separator)?;
-    Some((count.parse().ok()?, bound.parse().ok()?))
+impl<R: Read> Read for Tee<'_, '_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.source.read(buf)?;
+        self.tap.feed(&buf[..n]);
+        Ok(n)
+    }
+}
+
+/// [`Tee`] over an asynchronous source.
+struct AsyncTee<'t, 'p, S> {
+    source: &'t mut S,
+    tap: &'t mut Tap<'p>,
+}
+
+impl<S: AsyncByteSource> AsyncByteSource for AsyncTee<'_, '_, S> {
+    async fn next_chunk(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        let chunk = self.source.next_chunk().await?;
+        if let Some(chunk) = &chunk {
+            self.tap.feed(chunk);
+        }
+        Ok(chunk)
+    }
+}
+
+/// The output check of a transaction the stream yielded.
+fn streamed_output(payment: &PaymentToVerify<'_>, body: &TxBody) -> Result<u64, PaymentVerdict> {
+    let output = body.outputs.get(payment.output_index as usize);
+    check_output(
+        payment,
+        body.outputs.len(),
+        output.map(|o| (o.satoshis, &body.raw[o.script.clone()])),
+    )
+}
+
+/// The output check of a raw transaction, read whole (one element).
+fn raw_transaction_output(payment: &PaymentToVerify<'_>, raw: &[u8]) -> PaymentVerdict {
+    let malformed =
+        |e: String| PaymentVerdict::Unverifiable(UnverifiableReason::MalformedTransaction(e));
+    let transaction = match Transaction::from_binary(raw) {
+        Ok(transaction) => transaction,
+        Err(e) => return malformed(e.to_string()),
+    };
+    let output = match transaction.outputs.get(payment.output_index as usize) {
+        None => None,
+        Some(output) => match output.satoshis {
+            Some(satoshis) => Some((satoshis, output.locking_script.to_binary())),
+            None => return malformed("output carries no amount".to_string()),
+        },
+    };
+    let checked = check_output(
+        payment,
+        transaction.outputs.len(),
+        output
+            .as_ref()
+            .map(|(satoshis, script)| (*satoshis, &script[..])),
+    );
+    match checked {
+        Ok(satoshis) => PaymentVerdict::Verified { satoshis },
+        Err(verdict) => verdict,
+    }
 }
 
 /// Script first, then amount; the satoshis on success.
 fn check_output(
-    transaction: &Transaction,
     payment: &PaymentToVerify<'_>,
+    output_count: usize,
+    output: Option<(u64, &[u8])>,
 ) -> Result<u64, PaymentVerdict> {
-    let output = transaction
-        .outputs
-        .get(payment.output_index as usize)
-        .ok_or(PaymentVerdict::Unverifiable(
-            UnverifiableReason::OutputMissing {
-                output_index: payment.output_index,
-                output_count: transaction.outputs.len(),
-            },
-        ))?;
-    let actual = output.locking_script.to_binary();
+    let (paid, actual) = output.ok_or(PaymentVerdict::Unverifiable(
+        UnverifiableReason::OutputMissing {
+            output_index: payment.output_index,
+            output_count,
+        },
+    ))?;
     if actual != payment.expected_script {
         return Err(PaymentVerdict::WrongScript {
             expected: payment.expected_script.to_vec(),
-            actual,
+            actual: actual.to_vec(),
         });
     }
-    let paid = output.satoshis.ok_or(PaymentVerdict::Unverifiable(
-        UnverifiableReason::OutputWithoutAmount,
-    ))?;
     if paid < payment.required_satoshis {
         return Err(PaymentVerdict::Underpaid {
             paid,
@@ -618,7 +857,9 @@ mod tests {
     use super::*;
     use bsv_rs::primitives::PrivateKey;
     use bsv_rs::script::LockingScript;
-    use bsv_rs::transaction::{MerklePath, MerklePathLeaf, TransactionInput, TransactionOutput};
+    use bsv_rs::transaction::{
+        Beef, MerklePath, MerklePathLeaf, TransactionInput, TransactionOutput,
+    };
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -740,9 +981,8 @@ mod tests {
         }
     }
 
-    fn payment<'a>(tx: &'a [u8], index: u32, script: &'a [u8]) -> PaymentToVerify<'a> {
+    fn payment(index: u32, script: &[u8]) -> PaymentToVerify<'_> {
         PaymentToVerify {
-            transaction: tx,
             output_index: index,
             expected_script: script,
             required_satoshis: PRICE,
@@ -750,7 +990,7 @@ mod tests {
     }
 
     fn output_only(tx: &[u8], index: u32) -> PaymentVerdict {
-        verify_payment_output_only(&payment(tx, index, &server_script()))
+        verify_payment_output_only(&payment(index, &server_script()), tx).unwrap()
     }
 
     // ---- the output check (P0-3's ten cases, now in words) ----
@@ -843,12 +1083,23 @@ mod tests {
 
     #[test]
     fn malformed_bytes_are_unverifiable() {
-        for bytes in [&[1u8, 1, 1, 1, 0xff][..], b"not a transaction", &[]] {
+        // No BEEF version word leads: read as a raw transaction, and it is none.
+        for bytes in [&b"not a transaction"[..], &[], &[1, 1, 1]] {
             assert!(matches!(
                 output_only(bytes, 0),
                 PaymentVerdict::Unverifiable(UnverifiableReason::MalformedTransaction(_))
             ));
         }
+        // The Atomic prefix leads and the 32 bytes of its subject are cut
+        // short: the reader names the field and where it starts.
+        assert_eq!(
+            output_only(&[1, 1, 1, 1, 0xff], 0),
+            PaymentVerdict::Unverifiable(UnverifiableReason::InvalidBeef {
+                offset: 4,
+                kind: Kind::Truncated,
+                reason: Reason::Truncated { needed: 32 },
+            })
+        );
     }
 
     #[test]
@@ -878,7 +1129,9 @@ mod tests {
         let script = server_script();
         for bytes in [&b"garbage"[..], &proven_beef(&[(PRICE, payer_script())]).0] {
             assert_eq!(
-                verify_payment(&payment(bytes, 0, &script), None).await,
+                verify_payment(&payment(0, &script), bytes, None)
+                    .await
+                    .unwrap(),
                 PaymentVerdict::NoHeaderService
             );
         }
@@ -890,7 +1143,9 @@ mod tests {
         for answer in [root.clone(), root.to_uppercase()] {
             let headers = StubHeaders::answering(HEIGHT, Ok(answer));
             assert_eq!(
-                verify_payment(&payment(&beef, 0, &server_script()), Some(&headers)).await,
+                verify_payment(&payment(0, &server_script()), &beef[..], Some(&headers))
+                    .await
+                    .unwrap(),
                 PaymentVerdict::Verified {
                     satoshis: PRICE + 5
                 }
@@ -904,7 +1159,9 @@ mod tests {
         let (beef, root) = proven_beef(&[(PRICE, payer_script())]);
         let headers = StubHeaders::answering(HEIGHT, Ok("00".repeat(32)));
         assert_eq!(
-            verify_payment(&payment(&beef, 0, &server_script()), Some(&headers)).await,
+            verify_payment(&payment(0, &server_script()), &beef[..], Some(&headers))
+                .await
+                .unwrap(),
             PaymentVerdict::RootMismatch {
                 height: HEIGHT,
                 merkle_root: root
@@ -916,7 +1173,9 @@ mod tests {
     async fn a_lookup_that_cannot_answer_fails_closed_on_the_servers_side() {
         let (beef, _) = proven_beef(&[(PRICE, payer_script())]);
         let headers = StubHeaders::answering(HEIGHT, Err(HeaderLookupError("HTTP 503".into())));
-        let verdict = verify_payment(&payment(&beef, 0, &server_script()), Some(&headers)).await;
+        let verdict = verify_payment(&payment(0, &server_script()), &beef[..], Some(&headers))
+            .await
+            .unwrap();
         assert_eq!(
             verdict,
             PaymentVerdict::Unverifiable(UnverifiableReason::HeaderLookupFailed {
@@ -935,13 +1194,66 @@ mod tests {
         let (beef, root) = proven_beef(&[(PRICE - 1, payer_script())]);
         let headers = StubHeaders::answering(HEIGHT, Ok(root));
         assert_eq!(
-            verify_payment(&payment(&beef, 0, &server_script()), Some(&headers)).await,
+            verify_payment(&payment(0, &server_script()), &beef[..], Some(&headers))
+                .await
+                .unwrap(),
             PaymentVerdict::Underpaid {
                 paid: PRICE - 1,
                 required: PRICE
             }
         );
         assert!(headers.asked.lock().unwrap().is_empty());
+    }
+
+    /// A transaction with no input, paying `outputs`: nothing can prove it
+    /// and nothing beneath it exists.
+    fn rootless(outputs: &[(u64, Vec<u8>)]) -> Transaction {
+        let mut tx = Transaction::new();
+        for (satoshis, script) in outputs {
+            tx.add_output(TransactionOutput::new(
+                *satoshis,
+                LockingScript::from_binary(script).unwrap(),
+            ))
+            .unwrap();
+        }
+        tx
+    }
+
+    /// A transaction spending `parent:0` with an empty unlock.
+    fn spending(parent: &Transaction, outputs: &[(u64, Vec<u8>)]) -> Transaction {
+        let mut tx = rootless(outputs);
+        let mut input = TransactionInput::new(parent.id(), 0);
+        input.unlocking_script = Some(bsv_rs::script::UnlockingScript::new());
+        tx.inputs.push(input);
+        tx
+    }
+
+    /// A BEEF of `txs` in order, the first proven by a one-leaf BUMP at
+    /// `HEIGHT` when `proven`. Returns the BEEF and the first txid.
+    fn beef_of(txs: &[&Transaction], proven: bool) -> (Vec<u8>, String) {
+        let mut beef = Beef::new();
+        let root = txs[0].id();
+        let bump = proven.then(|| {
+            beef.merge_bump(
+                MerklePath::new(
+                    HEIGHT,
+                    vec![vec![MerklePathLeaf::new_txid(0, root.clone())]],
+                )
+                .unwrap(),
+            )
+        });
+        for (i, tx) in txs.iter().enumerate() {
+            beef.merge_raw_tx(tx.to_binary(), bump.filter(|_| i == 0));
+        }
+        (beef.to_binary(), root)
+    }
+
+    const OP_TRUE: &[u8] = &[0x51];
+
+    async fn full(beef: &[u8], script: &[u8], headers: &StubHeaders) -> PaymentVerdict {
+        verify_payment(&payment(0, script), beef, Some(headers))
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -966,15 +1278,305 @@ mod tests {
             beef.merge_transaction(lone);
             beef.to_binary()
         };
+        // The input's previous txid is at offset 4 + 1 + 1 + 1 + 4 + 1 = 12.
         assert_eq!(
-            verify_payment(&payment(&missing_parent, 0, &script), Some(&headers)).await,
-            PaymentVerdict::Unverifiable(UnverifiableReason::IncompleteBeef)
+            full(&missing_parent, &script, &headers).await,
+            PaymentVerdict::Unverifiable(UnverifiableReason::InvalidBeef {
+                offset: 12,
+                kind: Kind::InputNamesNoElement,
+                reason: Reason::InputNamesNoElement { txid: [0x22; 32] },
+            })
         );
+        // A raw transaction is no BEEF: its version word is not one.
         assert_eq!(
-            verify_payment(&payment(&tx.to_binary(), 0, &script), Some(&headers)).await,
-            PaymentVerdict::Unverifiable(UnverifiableReason::NoProof)
+            full(&tx.to_binary(), &script, &headers).await,
+            PaymentVerdict::Unverifiable(UnverifiableReason::InvalidBeef {
+                offset: 0,
+                kind: Kind::BadVersion,
+                reason: Reason::BadVersion { word: 1 },
+            })
         );
         assert!(headers.asked.lock().unwrap().is_empty());
+    }
+
+    // ---- what Verified means: the ancestry ends at a proven transaction ----
+
+    #[tokio::test]
+    async fn a_transaction_with_no_input_and_no_proof_anchors_nothing() {
+        // The reader's structure rule holds an unproven transaction by its
+        // inputs; one with no input passes it with nothing beneath. Alone,
+        // under a paying subject, or beside a proven stranger, it is no proof.
+        let headers = StubHeaders::answering(HEIGHT, Ok("00".repeat(32)));
+        let parent = rootless(&[(PRICE, OP_TRUE.to_vec())]);
+        let subject = spending(&parent, &[(PRICE, OP_TRUE.to_vec())]);
+        let (alone, _) = beef_of(&[&rootless(&[(PRICE, OP_TRUE.to_vec())])], false);
+        let (under, _) = beef_of(&[&parent, &subject], false);
+        let stranger = spending(&rootless(&[(1, vec![0x52])]), &[(7, vec![0x53])]);
+        let (beside, root) = beef_of(&[&stranger, &parent, &subject], true);
+        for beef in [&alone, &under] {
+            assert_eq!(
+                full(beef, OP_TRUE, &headers).await,
+                PaymentVerdict::Unverifiable(UnverifiableReason::NoProof)
+            );
+        }
+        assert!(headers.asked.lock().unwrap().is_empty());
+        // Every root the BEEF carries is the header's, and it is still no
+        // proof of the subject.
+        let carried = StubHeaders::answering(HEIGHT, Ok(root));
+        assert_eq!(
+            full(&beside, OP_TRUE, &carried).await,
+            PaymentVerdict::Unverifiable(UnverifiableReason::NoProof)
+        );
+        assert!(carried.asked.lock().unwrap().is_empty());
+        // The output check alone, opted into by name, reads the output.
+        assert_eq!(
+            verify_payment_output_only(&payment(0, OP_TRUE), &under[..]).unwrap(),
+            PaymentVerdict::Verified { satoshis: PRICE }
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unproven_subject_under_a_proven_parent_is_verified_when_it_spends() {
+        let parent = spending(&rootless(&[(1, vec![0x52])]), &[(PRICE, OP_TRUE.to_vec())]);
+        let subject = spending(&parent, &[(PRICE, OP_TRUE.to_vec())]);
+        let (beef, root) = beef_of(&[&parent, &subject], true);
+        let headers = StubHeaders::answering(HEIGHT, Ok(root));
+        assert_eq!(
+            full(&beef, OP_TRUE, &headers).await,
+            PaymentVerdict::Verified { satoshis: PRICE }
+        );
+        assert_eq!(*headers.asked.lock().unwrap(), vec![HEIGHT]);
+    }
+
+    #[tokio::test]
+    async fn a_spend_the_interpreter_refuses_is_unverifiable_and_asks_no_header() {
+        // The parent is locked to a key; the subject offers no signature.
+        let parent = spending(&rootless(&[(1, vec![0x52])]), &[(PRICE, p2pkh(&[7u8; 20]))]);
+        let subject = spending(&parent, &[(PRICE, OP_TRUE.to_vec())]);
+        let (beef, root) = beef_of(&[&parent, &subject], true);
+        let headers = StubHeaders::answering(HEIGHT, Ok(root));
+        let verdict = full(&beef, OP_TRUE, &headers).await;
+        let PaymentVerdict::Unverifiable(UnverifiableReason::SpendRefused {
+            txid, input, why, ..
+        }) = &verdict
+        else {
+            panic!("expected SpendRefused, got {verdict:?}");
+        };
+        assert_eq!(*txid, subject.id());
+        assert_eq!(*input, Some(0));
+        assert!(matches!(why, SpendRefusal::Script(_)), "{why:?}");
+        assert!(headers.asked.lock().unwrap().is_empty());
+        // 0.3.0 read the structure alone and answered Verified here.
+        assert_eq!(
+            verify_payment_output_only(&payment(0, OP_TRUE), &beef[..]).unwrap(),
+            PaymentVerdict::Verified { satoshis: PRICE }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transaction_that_creates_value_is_unverifiable() {
+        let parent = spending(&rootless(&[(1, vec![0x52])]), &[(PRICE, OP_TRUE.to_vec())]);
+        let subject = spending(&parent, &[(PRICE + 1, OP_TRUE.to_vec())]);
+        let (beef, root) = beef_of(&[&parent, &subject], true);
+        let headers = StubHeaders::answering(HEIGHT, Ok(root));
+        assert!(matches!(
+            full(&beef, OP_TRUE, &headers).await,
+            PaymentVerdict::Unverifiable(UnverifiableReason::SpendRefused {
+                why: SpendRefusal::CreatesValue,
+                input: None,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_beefs_own_fault_is_answered_before_the_output_is_judged() {
+        // The subject pays the wrong script and names a parent the BEEF does
+        // not carry: the reading stops at the invalid bytes.
+        let headers = StubHeaders::answering(HEIGHT, Ok("00".repeat(32)));
+        let orphan = spending(&rootless(&[(1, vec![0x52])]), &[(PRICE, vec![0x53])]);
+        let (beef, _) = beef_of(&[&orphan], false);
+        assert!(matches!(
+            full(&beef, OP_TRUE, &headers).await,
+            PaymentVerdict::Unverifiable(UnverifiableReason::InvalidBeef {
+                kind: Kind::InputNamesNoElement,
+                ..
+            })
+        ));
+        // The output check alone reads no structure and answers the script.
+        assert!(matches!(
+            verify_payment_output_only(&payment(0, OP_TRUE), &beef[..]).unwrap(),
+            PaymentVerdict::WrongScript { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_beef_with_no_transaction_pays_nothing() {
+        let headers = StubHeaders::answering(HEIGHT, Ok("00".repeat(32)));
+        let empty = Beef::new().to_binary();
+        assert_eq!(
+            full(&empty, OP_TRUE, &headers).await,
+            PaymentVerdict::Unverifiable(UnverifiableReason::NoTransaction)
+        );
+        assert_eq!(
+            verify_payment_output_only(&payment(0, OP_TRUE), &empty[..]).unwrap(),
+            PaymentVerdict::Unverifiable(UnverifiableReason::NoTransaction)
+        );
+    }
+
+    // ---- the source ----
+
+    /// A source that hands out `chunk` bytes at a time, then fails or ends.
+    struct Chunks<'a> {
+        bytes: &'a [u8],
+        chunk: usize,
+        fail_at_end: bool,
+    }
+
+    impl Read for Chunks<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.bytes.is_empty() && self.fail_at_end {
+                return Err(std::io::Error::other("the source broke"));
+            }
+            let n = self.chunk.min(buf.len()).min(self.bytes.len());
+            buf[..n].copy_from_slice(&self.bytes[..n]);
+            self.bytes = &self.bytes[n..];
+            Ok(n)
+        }
+    }
+
+    impl AsyncByteSource for Chunks<'_> {
+        async fn next_chunk(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+            let mut buf = vec![0u8; self.chunk];
+            let n = self.read(&mut buf)?;
+            buf.truncate(n);
+            Ok((n > 0).then_some(buf))
+        }
+    }
+
+    #[tokio::test]
+    async fn every_source_and_every_chunk_size_gives_the_same_verdict() {
+        let parent = spending(&rootless(&[(1, vec![0x52])]), &[(PRICE, OP_TRUE.to_vec())]);
+        let subject = spending(&parent, &[(PRICE, OP_TRUE.to_vec())]);
+        let (good, root) = beef_of(&[&parent, &subject], true);
+        let (wrong, _) = proven_beef(&[(PRICE, p2pkh(&[9u8; 20]))]);
+        let mut cut = good.clone();
+        cut.truncate(good.len() - 3);
+        let atomic = unproven_tx(&[(PRICE - 1, OP_TRUE.to_vec())])
+            .to_atomic_beef(true)
+            .unwrap();
+        for bytes in [&good, &wrong, &cut, &atomic] {
+            let headers = StubHeaders::answering(HEIGHT, Ok(root.clone()));
+            let whole = full(bytes, OP_TRUE, &headers).await;
+            let whole_output = verify_payment_output_only(&payment(0, OP_TRUE), &bytes[..]);
+            for chunk in [1, 2, 3, 5, 7, 64, 4096] {
+                let source = |fail_at_end| Chunks {
+                    bytes,
+                    chunk,
+                    fail_at_end,
+                };
+                let p = payment(0, OP_TRUE);
+                assert_eq!(
+                    verify_payment(&p, source(false), Some(&headers))
+                        .await
+                        .unwrap(),
+                    whole,
+                    "Read, {chunk} at a time"
+                );
+                assert_eq!(
+                    verify_payment_async(&p, &mut source(false), Some(&headers))
+                        .await
+                        .unwrap(),
+                    whole,
+                    "asynchronous, {chunk} at a time"
+                );
+                assert_eq!(
+                    verify_payment_output_only(&p, source(false)).unwrap(),
+                    *whole_output.as_ref().unwrap(),
+                    "output only, Read, {chunk} at a time"
+                );
+                assert_eq!(
+                    verify_payment_output_only_async(&p, &mut source(false))
+                        .await
+                        .unwrap(),
+                    *whole_output.as_ref().unwrap(),
+                    "output only, asynchronous, {chunk} at a time"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_source_that_fails_is_an_error_and_never_a_verdict() {
+        let (beef, root) = proven_beef(&[(PRICE, OP_TRUE.to_vec())]);
+        let headers = StubHeaders::answering(HEIGHT, Ok(root));
+        let p = payment(0, OP_TRUE);
+        let broken = || Chunks {
+            bytes: &beef,
+            chunk: 16,
+            fail_at_end: true,
+        };
+        assert!(verify_payment(&p, broken(), Some(&headers)).await.is_err());
+        assert!(verify_payment_async(&p, &mut broken(), Some(&headers))
+            .await
+            .is_err());
+        assert!(verify_payment_output_only(&p, broken()).is_err());
+        assert!(verify_payment_output_only_async(&p, &mut broken())
+            .await
+            .is_err());
+        assert!(headers.asked.lock().unwrap().is_empty());
+        // No header service is answered before the source is touched.
+        assert_eq!(
+            verify_payment(&p, broken(), None).await.unwrap(),
+            PaymentVerdict::NoHeaderService
+        );
+    }
+
+    // ---- the roots ----
+
+    /// A BEEF V2 of one BUMP at `height` (one leaf, the txid) and the
+    /// transaction it proves, written by hand: the SDK's in-memory BUMP has
+    /// no height above `u32::MAX`.
+    fn proven_at(height: u64, tx: &Transaction) -> Vec<u8> {
+        let raw = tx.to_binary();
+        let txid = bsv_rs::primitives::sha256d(&raw);
+        let mut v = BEEF_V2.to_le_bytes().to_vec();
+        v.push(1);
+        v.push(0xFF);
+        v.extend_from_slice(&height.to_le_bytes());
+        v.extend_from_slice(&[1, 1, 0, 2]);
+        v.extend_from_slice(&txid);
+        v.extend_from_slice(&[1, 1, 0]);
+        v.extend_from_slice(&raw);
+        v
+    }
+
+    #[tokio::test]
+    async fn a_height_no_header_service_can_be_asked_for_is_a_root_not_carried() {
+        let tx = spending(&rootless(&[(1, vec![0x52])]), &[(PRICE, OP_TRUE.to_vec())]);
+        let headers = StubHeaders::answering(HEIGHT, Ok("00".repeat(32)));
+        let height = u64::from(u32::MAX) + 1 + u64::from(HEIGHT);
+        let verdict = full(&proven_at(height, &tx), OP_TRUE, &headers).await;
+        assert!(
+            matches!(
+                verdict,
+                PaymentVerdict::Unverifiable(UnverifiableReason::InvalidBeef {
+                    offset: 5,
+                    kind: Kind::RootNotCarried,
+                    reason: Reason::RootNotCarried { height: h, .. },
+                }) if h == height
+            ),
+            "{verdict:?}"
+        );
+        // Never asked at the height's low 32 bits.
+        assert!(headers.asked.lock().unwrap().is_empty());
+        // The same bytes at a height a header service has are verified.
+        let root = tx.id();
+        let headers = StubHeaders::answering(HEIGHT, Ok(root));
+        assert_eq!(
+            full(&proven_at(u64::from(HEIGHT), &tx), OP_TRUE, &headers).await,
+            PaymentVerdict::Verified { satoshis: PRICE }
+        );
     }
 
     #[test]
