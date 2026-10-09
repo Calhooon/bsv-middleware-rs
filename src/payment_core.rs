@@ -906,16 +906,15 @@ mod tests {
     /// A crafted payment spending a crafted, unproven parent. Never signed,
     /// never broadcast.
     fn unproven_tx(outputs: &[(u64, Vec<u8>)]) -> Transaction {
-        let mut parent = Transaction::new();
-        parent
-            .add_output(TransactionOutput::new(
-                10_000,
-                LockingScript::from_binary(&p2pkh(&[7u8; 20])).unwrap(),
-            ))
-            .unwrap();
+        let parent = coinbase(&[(10_000, p2pkh(&[7u8; 20]))]);
         let mut tx = Transaction::new();
         tx.add_input(TransactionInput::with_source_transaction(parent, 0))
             .unwrap();
+        paying(tx, outputs)
+    }
+
+    /// `tx` with `outputs` appended.
+    fn paying(mut tx: Transaction, outputs: &[(u64, Vec<u8>)]) -> Transaction {
         for (satoshis, script) in outputs {
             tx.add_output(TransactionOutput::new(
                 *satoshis,
@@ -924,6 +923,18 @@ mod tests {
             .unwrap();
         }
         tx
+    }
+
+    /// A root of the coinbase shape, paying `outputs`: one input, the null
+    /// outpoint (the shape of bsv-rs's own one-transaction block and the
+    /// Lean's `loneTx`). Nothing beneath it is in any BEEF; a BUMP proves
+    /// it or nothing does.
+    fn coinbase(outputs: &[(u64, Vec<u8>)]) -> Transaction {
+        let mut tx = Transaction::new();
+        let mut input = TransactionInput::new("00".repeat(32), 0xFFFF_FFFF);
+        input.unlocking_script = Some(bsv_rs::script::UnlockingScript::new());
+        tx.inputs.push(input);
+        paying(tx, outputs)
     }
 
     /// A BEEF of one payment proven by a one-leaf BUMP at `HEIGHT` (a block of
@@ -1205,27 +1216,13 @@ mod tests {
         assert!(headers.asked.lock().unwrap().is_empty());
     }
 
-    /// A transaction with no input, paying `outputs`: nothing can prove it
-    /// and nothing beneath it exists.
-    fn rootless(outputs: &[(u64, Vec<u8>)]) -> Transaction {
-        let mut tx = Transaction::new();
-        for (satoshis, script) in outputs {
-            tx.add_output(TransactionOutput::new(
-                *satoshis,
-                LockingScript::from_binary(script).unwrap(),
-            ))
-            .unwrap();
-        }
-        tx
-    }
-
     /// A transaction spending `parent:0` with an empty unlock.
     fn spending(parent: &Transaction, outputs: &[(u64, Vec<u8>)]) -> Transaction {
-        let mut tx = rootless(outputs);
+        let mut tx = Transaction::new();
         let mut input = TransactionInput::new(parent.id(), 0);
         input.unlocking_script = Some(bsv_rs::script::UnlockingScript::new());
         tx.inputs.push(input);
-        tx
+        paying(tx, outputs)
     }
 
     /// A BEEF of `txs` in order, the first proven by a one-leaf BUMP at
@@ -1303,32 +1300,65 @@ mod tests {
 
     #[tokio::test]
     async fn a_transaction_with_no_input_and_no_proof_anchors_nothing() {
-        // The reader's structure rule holds an unproven transaction by its
-        // inputs; one with no input passes it with nothing beneath. Alone,
-        // under a paying subject, or beside a proven stranger, it is no proof.
+        // bsv-rs 0.4.1 refuses a transaction with no input as invalid bytes
+        // (`NoInputs`, the transaction's offset) before the door's own rule
+        // runs; the door's `NoProof` stays beneath it for a reader that does
+        // not. Alone, under a paying subject, or beside a proven stranger,
+        // the answer is the reader's refusal and nothing is asked.
         let headers = StubHeaders::answering(HEIGHT, Ok("00".repeat(32)));
-        let parent = rootless(&[(PRICE, OP_TRUE.to_vec())]);
+        // The one true transaction with no input, built here and nowhere else.
+        let mut parent = Transaction::new();
+        parent
+            .add_output(TransactionOutput::new(
+                PRICE,
+                LockingScript::from_binary(OP_TRUE).unwrap(),
+            ))
+            .unwrap();
+        assert!(parent.inputs.is_empty());
         let subject = spending(&parent, &[(PRICE, OP_TRUE.to_vec())]);
-        let (alone, _) = beef_of(&[&rootless(&[(PRICE, OP_TRUE.to_vec())])], false);
+        let (alone, _) = beef_of(&[&parent], false);
         let (under, _) = beef_of(&[&parent, &subject], false);
-        let stranger = spending(&rootless(&[(1, vec![0x52])]), &[(7, vec![0x53])]);
+        let stranger = spending(&coinbase(&[(1, vec![0x52])]), &[(7, vec![0x53])]);
         let (beside, root) = beef_of(&[&stranger, &parent, &subject], true);
+        let no_inputs = |offset: u64| {
+            PaymentVerdict::Unverifiable(UnverifiableReason::InvalidBeef {
+                offset,
+                kind: Kind::NoInputs,
+                reason: Reason::NoInputs,
+            })
+        };
+        // A V2 BEEF with no BUMP: the version word, the BUMP count, the
+        // transaction count, the element's format byte; the transaction's
+        // leading byte is at 4 + 1 + 1 + 1 = 7.
         for beef in [&alone, &under] {
-            assert_eq!(
-                full(beef, OP_TRUE, &headers).await,
-                PaymentVerdict::Unverifiable(UnverifiableReason::NoProof)
-            );
+            assert_eq!(full(beef, OP_TRUE, &headers).await, no_inputs(7));
         }
         assert!(headers.asked.lock().unwrap().is_empty());
-        // Every root the BEEF carries is the header's, and it is still no
-        // proof of the subject.
+        // Every root the BEEF carries is the header's, and the reader still
+        // refuses the bytes. The parent's leading byte is the subject's
+        // format byte and the parent's own bytes back from the end.
+        let at = (beside.len() - subject.to_binary().len() - 1 - parent.to_binary().len()) as u64;
         let carried = StubHeaders::answering(HEIGHT, Ok(root));
-        assert_eq!(
-            full(&beside, OP_TRUE, &carried).await,
-            PaymentVerdict::Unverifiable(UnverifiableReason::NoProof)
-        );
+        assert_eq!(full(&beside, OP_TRUE, &carried).await, no_inputs(at));
         assert!(carried.asked.lock().unwrap().is_empty());
-        // The output check alone, opted into by name, reads the output.
+        // The output check alone reads the same bytes and refuses them at
+        // the same offset: the reader's refusal is beneath both doors.
+        assert_eq!(
+            verify_payment_output_only(&payment(0, OP_TRUE), &under[..]).unwrap(),
+            no_inputs(7)
+        );
+        // The control: the same parent in the coinbase shape is past this
+        // rule, and its null outpoint names no element of the BEEF.
+        let parent = coinbase(&[(PRICE, OP_TRUE.to_vec())]);
+        let subject = spending(&parent, &[(PRICE, OP_TRUE.to_vec())]);
+        let (under, _) = beef_of(&[&parent, &subject], false);
+        assert!(matches!(
+            full(&under, OP_TRUE, &headers).await,
+            PaymentVerdict::Unverifiable(UnverifiableReason::InvalidBeef {
+                kind: Kind::InputNamesNoElement,
+                ..
+            })
+        ));
         assert_eq!(
             verify_payment_output_only(&payment(0, OP_TRUE), &under[..]).unwrap(),
             PaymentVerdict::Verified { satoshis: PRICE }
@@ -1337,7 +1367,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unproven_subject_under_a_proven_parent_is_verified_when_it_spends() {
-        let parent = spending(&rootless(&[(1, vec![0x52])]), &[(PRICE, OP_TRUE.to_vec())]);
+        let parent = spending(&coinbase(&[(1, vec![0x52])]), &[(PRICE, OP_TRUE.to_vec())]);
         let subject = spending(&parent, &[(PRICE, OP_TRUE.to_vec())]);
         let (beef, root) = beef_of(&[&parent, &subject], true);
         let headers = StubHeaders::answering(HEIGHT, Ok(root));
@@ -1351,7 +1381,7 @@ mod tests {
     #[tokio::test]
     async fn a_spend_the_interpreter_refuses_is_unverifiable_and_asks_no_header() {
         // The parent is locked to a key; the subject offers no signature.
-        let parent = spending(&rootless(&[(1, vec![0x52])]), &[(PRICE, p2pkh(&[7u8; 20]))]);
+        let parent = spending(&coinbase(&[(1, vec![0x52])]), &[(PRICE, p2pkh(&[7u8; 20]))]);
         let subject = spending(&parent, &[(PRICE, OP_TRUE.to_vec())]);
         let (beef, root) = beef_of(&[&parent, &subject], true);
         let headers = StubHeaders::answering(HEIGHT, Ok(root));
@@ -1375,7 +1405,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_transaction_that_creates_value_is_unverifiable() {
-        let parent = spending(&rootless(&[(1, vec![0x52])]), &[(PRICE, OP_TRUE.to_vec())]);
+        let parent = spending(&coinbase(&[(1, vec![0x52])]), &[(PRICE, OP_TRUE.to_vec())]);
         let subject = spending(&parent, &[(PRICE + 1, OP_TRUE.to_vec())]);
         let (beef, root) = beef_of(&[&parent, &subject], true);
         let headers = StubHeaders::answering(HEIGHT, Ok(root));
@@ -1394,7 +1424,7 @@ mod tests {
         // The subject pays the wrong script and names a parent the BEEF does
         // not carry: the reading stops at the invalid bytes.
         let headers = StubHeaders::answering(HEIGHT, Ok("00".repeat(32)));
-        let orphan = spending(&rootless(&[(1, vec![0x52])]), &[(PRICE, vec![0x53])]);
+        let orphan = spending(&coinbase(&[(1, vec![0x52])]), &[(PRICE, vec![0x53])]);
         let (beef, _) = beef_of(&[&orphan], false);
         assert!(matches!(
             full(&beef, OP_TRUE, &headers).await,
@@ -1456,7 +1486,7 @@ mod tests {
 
     #[tokio::test]
     async fn every_source_and_every_chunk_size_gives_the_same_verdict() {
-        let parent = spending(&rootless(&[(1, vec![0x52])]), &[(PRICE, OP_TRUE.to_vec())]);
+        let parent = spending(&coinbase(&[(1, vec![0x52])]), &[(PRICE, OP_TRUE.to_vec())]);
         let subject = spending(&parent, &[(PRICE, OP_TRUE.to_vec())]);
         let (good, root) = beef_of(&[&parent, &subject], true);
         let (wrong, _) = proven_beef(&[(PRICE, p2pkh(&[9u8; 20]))]);
@@ -1553,7 +1583,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_height_no_header_service_can_be_asked_for_is_a_root_not_carried() {
-        let tx = spending(&rootless(&[(1, vec![0x52])]), &[(PRICE, OP_TRUE.to_vec())]);
+        let tx = spending(&coinbase(&[(1, vec![0x52])]), &[(PRICE, OP_TRUE.to_vec())]);
         let headers = StubHeaders::answering(HEIGHT, Ok("00".repeat(32)));
         let height = u64::from(u32::MAX) + 1 + u64::from(HEIGHT);
         let verdict = full(&proven_at(height, &tx), OP_TRUE, &headers).await;
