@@ -137,7 +137,6 @@ async fn run_case(case: &Value) -> Observed {
     );
     let tx = hex::decode(case["transaction"]["beef_hex"].as_str().unwrap()).unwrap();
     let payment = PaymentToVerify {
-        transaction: &tx,
         output_index: case["output_index"].as_u64().unwrap() as u32,
         expected_script: &script,
         required_satoshis: case["required_satoshis"].as_u64().unwrap(),
@@ -150,7 +149,7 @@ async fn run_case(case: &Value) -> Observed {
             None,
             "{name}: the URL must name no service"
         );
-        return word(verify_payment(&payment, None).await);
+        return word(verify_payment(&payment, &tx[..], None).await.unwrap());
     }
     assert!(
         header_service_url(url).is_some(),
@@ -160,11 +159,15 @@ async fn run_case(case: &Value) -> Observed {
         lookup: case["header_service"]["lookup"].clone(),
         asked: Mutex::new(Vec::new()),
     };
-    let got = word(verify_payment(&payment, Some(&headers)).await);
+    let got = word(
+        verify_payment(&payment, &tx[..], Some(&headers))
+            .await
+            .unwrap(),
+    );
     let asked = headers.asked.lock().unwrap().clone();
     if stage == "output" {
         assert_eq!(
-            word(verify_payment_output_only(&payment)).word,
+            word(verify_payment_output_only(&payment, &tx[..]).unwrap()).word,
             got.word,
             "{name}: the output check alone gives the same word"
         );

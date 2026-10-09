@@ -132,10 +132,10 @@ pub fn parse_payment_header(header_value: &str) -> Result<BsvPayment> {
 // The payment-output rule lives in `crate::payment_core` (the core's API);
 // it is re-exported here so `payment::` paths keep naming it.
 pub use crate::payment_core::{
-    brc29_locking_script, header_service_url, verify_payment, verify_payment_output_only,
-    verify_payment_output_only_with_limits, verify_payment_with_limits, HeaderLookupError,
-    HeaderService, PaymentToVerify, PaymentVerdict, UnverifiableReason, BRC29_PROTOCOL_NAME,
-    MAX_PAYMENT_BEEF_BUMPS, MAX_PAYMENT_BEEF_TXS, MAX_PAYMENT_BYTES, PAYMENT_BEEF_LIMITS,
+    brc29_locking_script, header_service_url, verify_payment, verify_payment_async,
+    verify_payment_output_only, verify_payment_output_only_async, AsyncByteSource,
+    HeaderLookupError, HeaderService, Kind, PaymentToVerify, PaymentVerdict, Reason, SpendRefusal,
+    UnverifiableReason, BRC29_PROTOCOL_NAME,
 };
 
 /// Builds the 402 Payment Required response headers.
