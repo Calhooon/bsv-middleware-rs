@@ -82,7 +82,7 @@ pub fn create_derivation_prefix(wallet: &ProtoWallet) -> Result<String> {
     let hmac_result = wallet.create_hmac(CreateHmacArgs {
         data: random_bytes.to_vec(),
         protocol_id: Protocol::new(SecurityLevel::Silent, "server hmac"),
-        key_id: STANDARD.encode(&random_bytes),
+        key_id: STANDARD.encode(random_bytes),
         counterparty: None,
     })?;
 

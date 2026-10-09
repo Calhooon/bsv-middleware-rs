@@ -214,6 +214,8 @@ struct Authenticated {
     pub identity_key: String,
     pub session: StoredSession,
     pub request_id: [u8; 32],
+    // Carried for handlers that read the request body; the demo routes do not.
+    #[allow(dead_code)]
     pub body: Bytes,
 }
 
