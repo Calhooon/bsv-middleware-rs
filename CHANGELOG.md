@@ -2,6 +2,129 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-09
+
+The payment door reads a BEEF of any size. The posture, as a rule: a valid
+BEEF is never refused for its size or its counts; a refusal is for invalid
+bytes only, and names them. It is the owner's ruling of 2026-10-09 and the
+charter `docs/charters/beef-of-any-size.md` of the stack review repository
+(bsv-stack-lean; this release is its lane NL-5). The limits 0.2.2 added
+(P0-5d) and 0.3.0 carried were the fix of their hour; they refused valid
+payments by a number, and they go.
+
+### Removed (breaking)
+
+- `MAX_PAYMENT_BYTES` (4 MiB), `MAX_PAYMENT_BEEF_TXS` (128),
+  `MAX_PAYMENT_BEEF_BUMPS` (32) and `PAYMENT_BEEF_LIMITS`; the verifiers
+  `verify_payment_with_limits` and `verify_payment_output_only_with_limits`
+  (0.2.2's `verify_payment_output_with_limits` under its 0.3.0 names;
+  `verify_payment_output` itself left in 0.3.0). The crate exports no bound.
+- The reasons `PaymentTooLarge`, `BeefTransactionsExceeded` and
+  `BeefBumpsExceeded` of `UnverifiableReason`: nothing is refused for a
+  size or a count. `IncompleteBeef` and `OutputWithoutAmount` also go:
+  the first is now the reader's own refusal, with its offset and kind;
+  the second cannot arise from bytes.
+- `PaymentToVerify::transaction`: the payment's bytes are a source handed to
+  the verifier, not a slice held in the struct.
+
+### Changed (breaking)
+
+- `verify_payment(payment, transaction, header_service)` takes the payment
+  as a byte source (`transaction: impl std::io::Read`; a slice is one:
+  `&beef[..]`) and returns `std::io::Result<PaymentVerdict>`. It reads the
+  source once through `verify_stream` of bsv-rs 0.4.0 and holds one element
+  of the BEEF and the reader's index. `Err` is the source's failure: it says
+  nothing about the payment and is never an acceptance. The six words of
+  `PaymentVerdict` are unchanged.
+- `verify_payment_output_only(payment, transaction)` takes the same source
+  and returns `std::io::Result<PaymentVerdict>`; it cuts a BEEF into its
+  elements as it reads and keeps no index. A raw transaction is read whole
+  (it is one element).
+- The order of checks of the full check: no header service; the BEEF's own
+  validity by the streaming reader, at the soonest fault in stream order;
+  the subject's output (`WrongScript`, then `Underpaid`); a proof exists;
+  each root against the header service, lowest height first; `Verified`.
+  0.3.0 judged the output before the BEEF's structure: a payment with both
+  a wrong output and an invalid BEEF was `WrongScript` or `Underpaid` and is
+  now `Unverifiable`. No header is asked before the output is judged, as
+  before.
+- The full check runs the scripts. An unproven transaction's inputs are
+  executed against the parent outputs the BEEF carries, and a transaction
+  may not create value: `Unverifiable(SpendRefused { .. })`. 0.3.0 checked
+  the structure alone (`Beef::verify_valid`) and answered `Verified` for an
+  unproven payment whose spend no script allowed.
+- An Atomic BEEF is held to the reader's rule: the subject is the last raw
+  transaction and every other transaction is spent by a later one
+  (`InvalidBeef` with `SubjectMissing` or `UnrelatedTransaction`). 0.3.0
+  read past a retained descendant. The output-only check still reads the
+  named subject wherever it is.
+- An unproven transaction with no input is `Unverifiable(NoProof)` under
+  the full check. The reader holds an unproven transaction by its inputs,
+  so one with no input passed with nothing proven beneath it, and a payment
+  spending it was `Verified` whenever the BEEF also carried any BUMP the
+  headers knew.
+- A raw transaction under the full check is `InvalidBeef` (`BadVersion` at
+  offset 0), where 0.3.0 judged its output and then answered `NoProof`.
+- A source of fewer than four bytes, or one that does not lead with a BEEF
+  version word, is read by the output-only check as a raw transaction; a
+  source that leads with one is a BEEF and is refused as one.
+
+### Added
+
+- `UnverifiableReason::InvalidBeef { offset, kind, reason }`: the stream
+  offset of the invalid byte and one of the streaming reader's eighteen
+  kinds (`Kind`, `Reason`, re-exported from bsv-rs; the Lean definition
+  `BeefOfAnySize`). `SpendRefused { offset, txid, input, why }`
+  (`SpendRefusal`, re-exported). `NoTransaction` (a BEEF with no raw
+  transaction). All three are on the payer's side (`is_server_side()` is
+  false; 400 in the Axum layer). No reason is a size or a count.
+- `verify_payment_async` and `verify_payment_output_only_async`: the same
+  checks over an `AsyncByteSource` (the trait bsv-rs 0.4.0 ships,
+  re-exported), for a request body or an object store's body stream, on
+  `wasm32-unknown-unknown` as on native.
+- `axum_layer`: the body transport. A request whose `x-bsv-payment` header
+  names `derivationPrefix` and `derivationSuffix` and no `transaction` pays
+  with its body, the BEEF's bytes as they are; the gate streams the body
+  frame by frame through `verify_payment_async`, stops reading at the
+  soonest invalid byte, and refuses nothing for its size. The challenge
+  names both transports (`x-bsv-payment-transports: header,body`,
+  `PAYMENT_TRANSPORTS`). The header transport is unchanged. The body
+  transport is this crate's own: the reference middleware has the header
+  alone. The gate keeps the bytes it read for the handler
+  (`VerifiedPayment::transaction`), whose request body is then empty.
+
+### Tests
+
+- `tests/payment_limits.rs`: 0.2.2's boundary witnesses inverted (a valid
+  payment over 4 MiB, of 129 and 1,000 transactions, of 33 and 200 BUMPs is
+  `Verified`; a malformed one is refused with its offset and kind; the
+  sources name no bound).
+- `tests/payment_flat_memory.rs`: a payment of 100,000 unproven
+  transactions under one proven parent, read from a source that writes
+  itself: the output check's peak heap is the same at 1,000, 10,000 and
+  100,000 links, and the full check's is the SDK reader's plus a constant.
+- `tests/payment_deep_chain.rs`: the same readings, timed.
+- The BRC-29 vectors: the canonical file at 22 cases (the two no-root cases
+  of 2026-10-09), 22 exact; the runner holds each verdict to its HTTP class
+  by the reason's side, and a payer-side reason carries no fields.
+
+### Dependencies
+
+- `bsv-rs` 0.4.0 (was 0.3.35): the streaming BEEF reader.
+
+### Upgrade
+
+- `verify_payment(&PaymentToVerify { transaction: &beef, .. }, headers).await`
+  becomes `verify_payment(&PaymentToVerify { .. }, &beef[..], headers).await?`;
+  the output-only check likewise. A host holding a body stream implements
+  `AsyncByteSource` over it and calls `verify_payment_async`.
+- Delete any use of the four constants and the `_with_limits` verifiers; a
+  host that wants a transport budget sets it on its transport.
+- A match on `UnverifiableReason` drops the five removed reasons; the enum
+  is non-exhaustive, so the catch-all arm it already carries takes the new
+  ones.
+- 0.3.0 is not yanked.
+
 ## [0.3.0] - 2026-10-09
 
 ### Changed (breaking)
