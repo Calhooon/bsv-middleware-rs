@@ -34,8 +34,10 @@ getrandom = "0.4"
 # Async traits
 async-trait = "0.1"
 
-# The Axum adapter (`axum_layer`), behind the `axum` feature.
-axum = { version = "0.8", optional = true, default-features = false }
+# The Axum adapter (`axum_layer`), behind the `axum` feature. `json` is named
+# because the layer answers with `axum::Json`; the dev-dependency below turns
+# the default features on and would hide its absence from the tests.
+axum = { version = "0.8", optional = true, default-features = false, features = ["json"] }
 
 [features]
 default = []

@@ -42,7 +42,9 @@
   names no axum, tokio or reqwest type (`tests/core_boundary.rs`).
 - Feature `axum`: `axum_layer` with `PaymentGate`, `require_payment` and the
   `VerifiedPayment` extractor for Axum 0.8. The example needs the feature:
-  `cargo run --features axum --example axum_server`.
+  `cargo run --features axum --example axum_server`. The feature builds on
+  its own (axum without default features, `json` named) and for
+  `wasm32-unknown-unknown`.
 - `tests/conformance_brc29.rs` runs the BRC-29 payment conformance vectors,
   20 of 20 exact, from a byte-pinned copy under `tests/vectors/`; the gate's
   `vectors` job runs it.

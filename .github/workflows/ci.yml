@@ -47,6 +47,11 @@ jobs:
       - name: Run the tests
         run: cargo test --all-features
 
+      # The tests build with the dev-dependencies, whose axum has its default
+      # features; a caller's build of the feature does not.
+      - name: Build the library with the axum feature alone
+        run: cargo build --lib --features axum
+
   fmt:
     runs-on: ubuntu-latest
     steps:
