@@ -4,8 +4,10 @@
 //! and the core handshake state machine — all framework-agnostic.
 
 use async_trait::async_trait;
-use bsv_rs::wallet::{ProtoWallet, CreateSignatureArgs, VerifySignatureArgs, Protocol, SecurityLevel, Counterparty};
 use bsv_rs::auth::AuthMessage;
+use bsv_rs::wallet::{
+    Counterparty, CreateSignatureArgs, ProtoWallet, Protocol, SecurityLevel, VerifySignatureArgs,
+};
 use bsv_rs::PublicKey;
 
 use crate::error::Result;
@@ -34,7 +36,10 @@ pub trait SessionStorage: Send + Sync {
 
     /// Finds an existing session for an identity key.
     /// Returns the most recent session if multiple exist.
-    async fn get_session_by_identity(&self, identity_key_hex: &str) -> Result<Option<StoredSession>>;
+    async fn get_session_by_identity(
+        &self,
+        identity_key_hex: &str,
+    ) -> Result<Option<StoredSession>>;
 }
 
 /// Session info needed for response signing.

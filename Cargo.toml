@@ -1,6 +1,6 @@
 [package]
 name = "bsv-middleware-rs"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 authors = ["John Calhoun <dev@calhounjohn.com>"]
 description = "Framework-agnostic BRC-31 authentication and BRC-29 payment middleware for BSV"
@@ -12,7 +12,7 @@ categories = ["authentication", "cryptography", "web-programming"]
 
 [dependencies]
 # BSV SDK - provides auth protocol, wallet, key derivation
-bsv-rs = { version = "0.3", features = ["auth", "wallet", "transaction"] }
+bsv-rs = { version = "0.3.35", features = ["auth", "wallet", "transaction"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

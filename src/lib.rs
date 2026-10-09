@@ -27,13 +27,12 @@ pub mod payment;
 pub mod transport;
 pub mod types;
 
-pub use auth::{
-    sign_message, verify_message_signature, SessionStorage,
-};
+pub use auth::{sign_message, verify_message_signature, SessionStorage};
 pub use error::{AuthError, Result};
 pub use payment::{
-    brc29_locking_script, payment_headers, verify_payment_output, PaymentOutputError,
-    PaymentStorage,
+    brc29_locking_script, payment_headers, verify_payment_output,
+    verify_payment_output_with_limits, PaymentOutputError, PaymentStorage, MAX_PAYMENT_BEEF_BUMPS,
+    MAX_PAYMENT_BEEF_TXS, MAX_PAYMENT_BYTES, PAYMENT_BEEF_LIMITS,
 };
 pub use transport::auth_headers;
 pub use types::{
