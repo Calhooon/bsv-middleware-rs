@@ -51,18 +51,15 @@ payments by a number, and they go.
 - The full check runs the scripts. An unproven transaction's inputs are
   executed against the parent outputs the BEEF carries, and a transaction
   may not create value: `Unverifiable(SpendRefused { .. })`. 0.3.0 checked
-  the structure alone (`Beef::verify_valid`) and answered `Verified` for an
-  unproven payment whose spend no script allowed.
+  the structure alone (`Beef::verify_valid`).
 - An Atomic BEEF is held to the reader's rule: the subject is the last raw
   transaction and every other transaction is spent by a later one
   (`InvalidBeef` with `SubjectMissing` or `UnrelatedTransaction`). 0.3.0
   read past a retained descendant. The output-only check still reads the
   named subject wherever it is.
 - An unproven transaction with no input is `Unverifiable(NoProof)` under
-  the full check. The reader holds an unproven transaction by its inputs,
-  so one with no input passed with nothing proven beneath it, and a payment
-  spending it was `Verified` whenever the BEEF also carried any BUMP the
-  headers knew.
+  the full check: the reader holds an unproven transaction by its inputs,
+  and one with no input has nothing proven beneath it.
 - A raw transaction under the full check is `InvalidBeef` (`BadVersion` at
   offset 0), where 0.3.0 judged its output and then answered `NoProof`.
 - A source of fewer than four bytes, or one that does not lead with a BEEF
