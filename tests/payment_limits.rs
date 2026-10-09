@@ -1,14 +1,14 @@
 //! Small boundary witnesses for the shared payment door (P0-5d, issue #57).
 //! No exhaustion shapes: at most 129 transactions or 33 single-leaf BUMPs.
 
-use bsv_middleware_rs::{verify_payment_output, PaymentOutputError};
+use bsv_middleware_rs::{
+    verify_payment_output, verify_payment_output_with_limits, PaymentOutputError,
+    MAX_PAYMENT_BEEF_BUMPS, MAX_PAYMENT_BEEF_TXS, MAX_PAYMENT_BYTES, PAYMENT_BEEF_LIMITS,
+};
 use bsv_rs::script::{LockingScript, UnlockingScript};
-use bsv_rs::transaction::{Beef, MerklePath, Transaction, TransactionInput, TransactionOutput};
-
-// Kept local for the red run: these proposed defaults do not exist at 20c1a65.
-const MAX_PAYMENT_BYTES: usize = 4 * 1024 * 1024;
-const MAX_PAYMENT_BEEF_TXS: usize = 128;
-const MAX_PAYMENT_BEEF_BUMPS: usize = 32;
+use bsv_rs::transaction::{
+    Beef, BeefLimits, MerklePath, Transaction, TransactionInput, TransactionOutput,
+};
 const SCRIPT: &[u8] = &[0x51];
 const PRICE: u64 = 100;
 
@@ -145,4 +145,140 @@ fn one_bump_over_is_refused_with_the_count_and_bound() {
         message.contains("max_bumps 32"),
         "names the bound: {message}"
     );
+}
+
+#[test]
+fn custom_byte_budget_is_checked_before_parsing_either_format() {
+    for bytes in [vec![0; 41], malformed_atomic(41)] {
+        assert_eq!(
+            verify_payment_output_with_limits(&bytes, 0, SCRIPT, PRICE, 40, &PAYMENT_BEEF_LIMITS),
+            Err(PaymentOutputError::PaymentTooLarge {
+                bytes: 41,
+                max_bytes: 40,
+            })
+        );
+    }
+}
+
+#[test]
+fn custom_beef_byte_budget_can_be_smaller_than_the_outer_budget() {
+    let bytes = malformed_atomic(41);
+    let limits = BeefLimits {
+        max_bytes: 40,
+        ..PAYMENT_BEEF_LIMITS
+    };
+    assert_eq!(
+        verify_payment_output_with_limits(&bytes, 0, SCRIPT, PRICE, 41, &limits),
+        Err(PaymentOutputError::PaymentTooLarge {
+            bytes: 41,
+            max_bytes: 40
+        })
+    );
+}
+
+#[test]
+fn custom_beef_counts_admit_at_the_bound_and_refuse_one_over() {
+    let limits = BeefLimits {
+        max_txs: 4,
+        max_bumps: 2,
+        max_bytes: MAX_PAYMENT_BYTES,
+    };
+    let at_bound = chain_atomic(4);
+    assert_eq!(
+        verify_payment_output_with_limits(&at_bound, 0, SCRIPT, PRICE, at_bound.len(), &limits),
+        Ok(PRICE)
+    );
+    let one_over = chain_atomic(5);
+    assert_eq!(
+        verify_payment_output_with_limits(&one_over, 0, SCRIPT, PRICE, one_over.len(), &limits),
+        Err(PaymentOutputError::BeefTransactionsExceeded {
+            count: 5,
+            max_txs: 4
+        })
+    );
+    let at_bound = funded_atomic(2);
+    assert_eq!(
+        verify_payment_output_with_limits(&at_bound, 0, SCRIPT, PRICE, at_bound.len(), &limits),
+        Ok(PRICE)
+    );
+    let one_over = funded_atomic(3);
+    assert_eq!(
+        verify_payment_output_with_limits(&one_over, 0, SCRIPT, PRICE, one_over.len(), &limits),
+        Err(PaymentOutputError::BeefBumpsExceeded {
+            count: 3,
+            max_bumps: 2
+        })
+    );
+}
+
+#[test]
+fn a_caller_can_admit_counts_above_the_default_budgets() {
+    let limits = BeefLimits {
+        max_txs: MAX_PAYMENT_BEEF_TXS + 1,
+        max_bumps: MAX_PAYMENT_BEEF_BUMPS + 1,
+        max_bytes: MAX_PAYMENT_BYTES,
+    };
+    for bytes in [
+        chain_atomic(limits.max_txs),
+        funded_atomic(limits.max_bumps),
+    ] {
+        assert_eq!(
+            verify_payment_output_with_limits(&bytes, 0, SCRIPT, PRICE, bytes.len(), &limits),
+            Ok(PRICE)
+        );
+    }
+}
+
+#[test]
+fn raw_transactions_ignore_beef_budgets_and_admit_the_exact_byte_budget() {
+    let raw = small_transaction("aa".repeat(32), 0).to_binary();
+    let limits = BeefLimits {
+        max_txs: 0,
+        max_bumps: 0,
+        max_bytes: 0,
+    };
+    assert_eq!(
+        verify_payment_output_with_limits(&raw, 0, SCRIPT, PRICE, raw.len(), &limits),
+        Ok(PRICE)
+    );
+    assert_eq!(
+        verify_payment_output_with_limits(&raw, 0, SCRIPT, PRICE, raw.len() - 1, &limits),
+        Err(PaymentOutputError::PaymentTooLarge {
+            bytes: raw.len(),
+            max_bytes: raw.len() - 1
+        })
+    );
+}
+
+#[test]
+fn the_declared_atomic_subject_is_used_even_when_it_is_not_last() {
+    let mut beef = Beef::from_binary(&chain_atomic(3)).expect("honest BEEF");
+    let subject = beef.atomic_txid.clone().expect("Atomic subject");
+    // A retained descendant sorts after the declared subject. Historical
+    // Atomic writers could retain branches beyond the subject (reference
+    // payment-express-middleware/src/index.ts:110-112 at fb1b2da).
+    let mut different = small_transaction(subject.clone(), 99);
+    different.outputs[0].satoshis = Some(PRICE - 1);
+    beef.merge_raw_tx(different.to_binary(), None);
+    let bytes = beef.to_binary_atomic(&subject).expect("Atomic BEEF");
+    assert_ne!(
+        Beef::from_binary(&bytes)
+            .expect("BEEF")
+            .txs
+            .last()
+            .unwrap()
+            .txid(),
+        subject
+    );
+    assert_eq!(verify_payment_output(&bytes, 0, SCRIPT, PRICE), Ok(PRICE));
+}
+
+#[test]
+fn malformed_atomic_subject_is_still_a_parse_error() {
+    let mut bytes = chain_atomic(2);
+    bytes[4..36].fill(0);
+    assert!(matches!(
+        verify_payment_output(&bytes, 0, SCRIPT, PRICE),
+        Err(PaymentOutputError::MalformedTransaction(message)) if message == "Atomic transaction not found"
+    ));
 }

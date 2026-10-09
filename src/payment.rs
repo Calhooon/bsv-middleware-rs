@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use bsv_rs::primitives::PublicKey;
-use bsv_rs::transaction::Transaction;
+use bsv_rs::transaction::{Beef, BeefLimits, Transaction};
 use bsv_rs::wallet::{
     Counterparty, CreateHmacArgs, GetPublicKeyArgs, ProtoWallet, Protocol, SecurityLevel,
 };
@@ -50,7 +50,11 @@ pub trait PaymentStorage: Send + Sync {
     async fn mark_spent(&self, txid: &str, vout: u32) -> Result<()>;
 
     /// Stores a derivation prefix with TTL for one-time use.
-    async fn store_derivation_prefix(&self, derivation_prefix: &str, ttl_seconds: u64) -> Result<()>;
+    async fn store_derivation_prefix(
+        &self,
+        derivation_prefix: &str,
+        ttl_seconds: u64,
+    ) -> Result<()>;
 
     /// Consumes a derivation prefix (returns true if it existed and was consumed).
     /// This prevents replay attacks — each prefix can only be used once.
@@ -66,8 +70,8 @@ pub const NONCE_ORIGINATOR: &str = "payment middleware";
 /// The server can verify it later using only its private key,
 /// with no database lookup required.
 pub fn create_derivation_prefix(wallet: &ProtoWallet) -> Result<String> {
-    use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
 
     // Generate 16 random bytes
     let mut random_bytes = [0u8; 16];
@@ -96,10 +100,11 @@ pub fn create_derivation_prefix(wallet: &ProtoWallet) -> Result<String> {
 /// Uses stateless HMAC verification — recomputes the HMAC from the
 /// random portion and compares against the claimed HMAC.
 pub fn verify_derivation_prefix(wallet: &ProtoWallet, nonce: &str) -> Result<bool> {
-    use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
 
-    let nonce_bytes = STANDARD.decode(nonce)
+    let nonce_bytes = STANDARD
+        .decode(nonce)
         .map_err(|_| AuthError::InvalidDerivationPrefix)?;
 
     if nonce_bytes.len() != 32 {
@@ -132,9 +137,58 @@ pub fn parse_payment_header(header_value: &str) -> Result<BsvPayment> {
 /// payer derives the paying key under.
 pub const BRC29_PROTOCOL_NAME: &str = "3241645161d8";
 
+/// Maximum decoded payment size: 4 MiB, matching the message box's standard
+/// body budget (`ts-stack@fb1b2da infra/message-box-server/src/app.ts:195-208`).
+/// The reference middleware uses a base64 JSON `x-bsv-payment` header with no
+/// code size cap (`payment-express-middleware/src/index.ts:67-107`); Node's
+/// default HTTP header budget is 16 KiB. The larger shared bound also serves
+/// body callers and accommodates the known 1.9 MB ancestor (Zanaadu #357).
+/// Callers must bound their transport before reading or decoding the payment.
+pub const MAX_PAYMENT_BYTES: usize = 4 * 1024 * 1024;
+
+/// Maximum payment BEEF transactions: room for the subject and 127 ancestors
+/// through its proven funding roots. This is a door policy with headroom for
+/// branching unproven funding, not a limit on valid chain transactions. A
+/// large proven ancestor (Zanaadu #357) needs bytes, not thousands of entries.
+pub const MAX_PAYMENT_BEEF_TXS: usize = 128;
+
+/// Maximum payment BUMPs: 32 distinct proof blocks allow consolidated funding
+/// within the 128-transaction budget. A BUMP may prove several ancestors;
+/// this counts proof blocks, not leaves. The byte bound and the SDK's bounded
+/// parser also apply. Callers with a different policy can supply their limits.
+pub const MAX_PAYMENT_BEEF_BUMPS: usize = 32;
+
+/// Default bounds for the shared payment door, including the Atomic prefix.
+pub const PAYMENT_BEEF_LIMITS: BeefLimits = BeefLimits {
+    max_txs: MAX_PAYMENT_BEEF_TXS,
+    max_bumps: MAX_PAYMENT_BEEF_BUMPS,
+    max_bytes: MAX_PAYMENT_BYTES,
+};
+
 /// Why a payment transaction does not pay the price to the server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaymentOutputError {
+    /// The payment exceeds its byte budget, checked before parsing.
+    PaymentTooLarge {
+        /// The complete serialized payment length.
+        bytes: usize,
+        /// The byte budget that was exceeded.
+        max_bytes: usize,
+    },
+    /// The BEEF transaction count prefix exceeds the door's budget.
+    BeefTransactionsExceeded {
+        /// The count claimed by the BEEF.
+        count: usize,
+        /// The maximum transaction count.
+        max_txs: usize,
+    },
+    /// The BEEF BUMP count prefix exceeds the door's budget.
+    BeefBumpsExceeded {
+        /// The count claimed by the BEEF.
+        count: usize,
+        /// The maximum BUMP count.
+        max_bumps: usize,
+    },
     /// The bytes are neither an Atomic BEEF nor a raw transaction.
     MalformedTransaction(String),
     /// The transaction has no output at the index being internalized.
@@ -161,8 +215,26 @@ pub enum PaymentOutputError {
 impl std::fmt::Display for PaymentOutputError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::PaymentTooLarge { bytes, max_bytes } => write!(
+                f,
+                "payment transaction is {} bytes, over max_bytes {}",
+                bytes, max_bytes
+            ),
+            Self::BeefTransactionsExceeded { count, max_txs } => write!(
+                f,
+                "payment BEEF claims {} transactions, over max_txs {}",
+                count, max_txs
+            ),
+            Self::BeefBumpsExceeded { count, max_bumps } => write!(
+                f,
+                "payment BEEF claims {} BUMPs, over max_bumps {}",
+                count, max_bumps
+            ),
             Self::MalformedTransaction(e) => write!(f, "payment transaction is malformed: {}", e),
-            Self::OutputMissing { output_index, output_count } => write!(
+            Self::OutputMissing {
+                output_index,
+                output_count,
+            } => write!(
                 f,
                 "payment output {} is missing (transaction has {} outputs)",
                 output_index, output_count
@@ -203,7 +275,10 @@ pub fn brc29_locking_script(
     let sender = PublicKey::from_hex(sender_identity_key)?;
     let derived = wallet.get_public_key(GetPublicKeyArgs {
         identity_key: false,
-        protocol_id: Some(Protocol::new(SecurityLevel::Counterparty, BRC29_PROTOCOL_NAME)),
+        protocol_id: Some(Protocol::new(
+            SecurityLevel::Counterparty,
+            BRC29_PROTOCOL_NAME,
+        )),
         key_id: Some(format!("{} {}", derivation_prefix, derivation_suffix)),
         counterparty: Some(Counterparty::Other(sender)),
         for_self: Some(true),
@@ -224,25 +299,73 @@ pub fn brc29_locking_script(
 /// be locked to that script and carry at least `price`. Call it before
 /// internalizing: neither the reference storage server nor wallet-infra
 /// compares the amount or checks the script.
+///
+/// Payments over [`MAX_PAYMENT_BYTES`] are refused before parsing. Atomic
+/// BEEF counts are bounded by [`PAYMENT_BEEF_LIMITS`]. Use
+/// [`verify_payment_output_with_limits`] for a caller's own budgets.
 pub fn verify_payment_output(
     tx: &[u8],
     output_index: u32,
     expected_script: &[u8],
     price: u64,
 ) -> std::result::Result<u64, PaymentOutputError> {
+    verify_payment_output_with_limits(
+        tx,
+        output_index,
+        expected_script,
+        price,
+        MAX_PAYMENT_BYTES,
+        &PAYMENT_BEEF_LIMITS,
+    )
+}
+
+/// Reads a payment output with caller-supplied byte and Atomic BEEF budgets.
+///
+/// `max_bytes` bounds both formats before parsing; `beef_limits.max_bytes`
+/// additionally bounds Atomic BEEF, so the smaller byte budget wins there.
+/// BEEF count prefixes are checked before their entries are read. Extraction
+/// uses [`Beef::find_atomic_transaction`], the same function used by
+/// [`Transaction::from_atomic_beef`] in bsv-rs 0.3.35, after a bounded parse.
+/// A raw transaction uses [`Transaction::from_binary`] under `max_bytes`.
+/// The caller must also bound transport reads and decoding before this call.
+pub fn verify_payment_output_with_limits(
+    tx: &[u8],
+    output_index: u32,
+    expected_script: &[u8],
+    price: u64,
+    max_bytes: usize,
+    beef_limits: &BeefLimits,
+) -> std::result::Result<u64, PaymentOutputError> {
+    if tx.len() > max_bytes {
+        return Err(PaymentOutputError::PaymentTooLarge {
+            bytes: tx.len(),
+            max_bytes,
+        });
+    }
     let malformed = |e: bsv_rs::Error| PaymentOutputError::MalformedTransaction(e.to_string());
     let transaction = if tx.starts_with(&ATOMIC_BEEF_PREFIX) {
-        Transaction::from_atomic_beef(tx).map_err(malformed)?
+        if tx.len() > beef_limits.max_bytes {
+            return Err(PaymentOutputError::PaymentTooLarge {
+                bytes: tx.len(),
+                max_bytes: beef_limits.max_bytes,
+            });
+        }
+        let beef = Beef::from_binary_with_limits(tx, beef_limits).map_err(bounded_beef_error)?;
+        let txid = beef.atomic_txid.as_deref().ok_or_else(|| {
+            PaymentOutputError::MalformedTransaction("Not an Atomic BEEF format".to_string())
+        })?;
+        beef.find_atomic_transaction(txid).ok_or_else(|| {
+            PaymentOutputError::MalformedTransaction("Atomic transaction not found".to_string())
+        })?
     } else {
         Transaction::from_binary(tx).map_err(malformed)?
     };
-    let output = transaction
-        .outputs
-        .get(output_index as usize)
-        .ok_or(PaymentOutputError::OutputMissing {
+    let output = transaction.outputs.get(output_index as usize).ok_or(
+        PaymentOutputError::OutputMissing {
             output_index,
             output_count: transaction.outputs.len(),
-        })?;
+        },
+    )?;
     if output.locking_script.to_binary() != expected_script {
         return Err(PaymentOutputError::ScriptMismatch { output_index });
     }
@@ -256,6 +379,26 @@ pub fn verify_payment_output(
         });
     }
     Ok(paid)
+}
+
+// bsv-rs 0.3.35 exposes limit diagnostics as BeefError(String). Translate its
+// exact count diagnostics; other parser errors retain the malformed verdict.
+fn bounded_beef_error(error: bsv_rs::Error) -> PaymentOutputError {
+    if let bsv_rs::Error::BeefError(message) = &error {
+        if let Some((count, max_txs)) = beef_limit_counts(message, " transactions, over max_txs ") {
+            return PaymentOutputError::BeefTransactionsExceeded { count, max_txs };
+        }
+        if let Some((count, max_bumps)) = beef_limit_counts(message, " BUMPs, over max_bumps ") {
+            return PaymentOutputError::BeefBumpsExceeded { count, max_bumps };
+        }
+    }
+    PaymentOutputError::MalformedTransaction(error.to_string())
+}
+
+fn beef_limit_counts(message: &str, separator: &str) -> Option<(usize, usize)> {
+    let claimed = message.strip_prefix("BEEF claims ")?;
+    let (count, bound) = claimed.split_once(separator)?;
+    Some((count.parse().ok()?, bound.parse().ok()?))
 }
 
 /// The Atomic BEEF prefix (BRC-95), `0x01010101` little-endian.
@@ -302,7 +445,8 @@ mod tests {
 
     #[test]
     fn test_parse_payment_header() {
-        let json = r#"{"derivationPrefix":"abc","derivationSuffix":"def","transaction":"base64tx"}"#;
+        let json =
+            r#"{"derivationPrefix":"abc","derivationSuffix":"def","transaction":"base64tx"}"#;
         let payment = parse_payment_header(json).unwrap();
         assert_eq!(payment.derivation_prefix, "abc");
         assert_eq!(payment.derivation_suffix, "def");
@@ -368,7 +512,10 @@ mod tests {
         let derived = sender
             .get_public_key(GetPublicKeyArgs {
                 identity_key: false,
-                protocol_id: Some(Protocol::new(SecurityLevel::Counterparty, BRC29_PROTOCOL_NAME)),
+                protocol_id: Some(Protocol::new(
+                    SecurityLevel::Counterparty,
+                    BRC29_PROTOCOL_NAME,
+                )),
                 key_id: Some(format!("{} {}", PREFIX, SUFFIX)),
                 counterparty: Some(Counterparty::Other(server_identity)),
                 for_self: Some(false),
@@ -417,7 +564,10 @@ mod tests {
     #[test]
     fn exact_price_is_accepted_and_returns_the_price() {
         let tx = atomic(&[(PRICE, payer_script())]);
-        assert_eq!(verify_payment_output(&tx, 0, &server_script(), PRICE), Ok(PRICE));
+        assert_eq!(
+            verify_payment_output(&tx, 0, &server_script(), PRICE),
+            Ok(PRICE)
+        );
     }
 
     #[test]
@@ -425,14 +575,20 @@ mod tests {
         let tx = atomic(&[(PRICE - 1, payer_script())]);
         assert_eq!(
             verify_payment_output(&tx, 0, &server_script(), PRICE),
-            Err(PaymentOutputError::Underpaid { paid: PRICE - 1, required: PRICE })
+            Err(PaymentOutputError::Underpaid {
+                paid: PRICE - 1,
+                required: PRICE
+            })
         );
     }
 
     #[test]
     fn one_satoshi_over_is_accepted_and_returns_the_real_amount() {
         let tx = atomic(&[(PRICE + 1, payer_script())]);
-        assert_eq!(verify_payment_output(&tx, 0, &server_script(), PRICE), Ok(PRICE + 1));
+        assert_eq!(
+            verify_payment_output(&tx, 0, &server_script(), PRICE),
+            Ok(PRICE + 1)
+        );
     }
 
     #[test]
@@ -453,7 +609,10 @@ mod tests {
             verify_payment_output(&tx, 0, &server_script(), PRICE),
             Err(PaymentOutputError::ScriptMismatch { output_index: 0 })
         );
-        assert_eq!(verify_payment_output(&tx, 1, &server_script(), PRICE), Ok(PRICE));
+        assert_eq!(
+            verify_payment_output(&tx, 1, &server_script(), PRICE),
+            Ok(PRICE)
+        );
     }
 
     #[test]
@@ -461,7 +620,10 @@ mod tests {
         let tx = atomic(&[(PRICE, payer_script())]);
         assert_eq!(
             verify_payment_output(&tx, 1, &server_script(), PRICE),
-            Err(PaymentOutputError::OutputMissing { output_index: 1, output_count: 1 })
+            Err(PaymentOutputError::OutputMissing {
+                output_index: 1,
+                output_count: 1
+            })
         );
     }
 
@@ -482,15 +644,25 @@ mod tests {
         let raw = payment_tx(&[(PRICE - 1, payer_script())]).to_binary();
         assert_eq!(
             verify_payment_output(&raw, 0, &server_script(), PRICE),
-            Err(PaymentOutputError::Underpaid { paid: PRICE - 1, required: PRICE })
+            Err(PaymentOutputError::Underpaid {
+                paid: PRICE - 1,
+                required: PRICE
+            })
         );
         let raw = payment_tx(&[(PRICE, payer_script())]).to_binary();
-        assert_eq!(verify_payment_output(&raw, 0, &server_script(), PRICE), Ok(PRICE));
+        assert_eq!(
+            verify_payment_output(&raw, 0, &server_script(), PRICE),
+            Ok(PRICE)
+        );
     }
 
     #[test]
     fn a_shortfall_maps_to_invalid_payment() {
-        let e: AuthError = PaymentOutputError::Underpaid { paid: 1, required: 2 }.into();
+        let e: AuthError = PaymentOutputError::Underpaid {
+            paid: 1,
+            required: 2,
+        }
+        .into();
         assert_eq!(e.error_code(), "ERR_INVALID_PAYMENT");
         assert_eq!(e.status_code(), 400);
     }
