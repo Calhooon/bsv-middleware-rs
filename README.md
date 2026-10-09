@@ -18,8 +18,8 @@ bsv-rs = { version = "0.3", features = ["auth", "wallet"] }
 |--------|-------------|
 | **auth** | BRC-31 message signing/verification, `SessionStorage` trait |
 | **payment** | BRC-29 HMAC nonce creation/verification, 402 flow helpers, `PaymentStorage` trait |
-| **payment_core** | The payment-output rule with no runtime types: `verify_payment` answers one of six words (`PaymentVerdict`), takes a `HeaderService` trait, fails closed without one |
-| **axum_layer** (feature `axum`) | `require_payment` (the gate) and the `VerifiedPayment` extractor for Axum 0.8 |
+| **payment_core** | The payment-output rule with no runtime types: `verify_payment` reads the payment from a byte source through the streaming BEEF reader of bsv-rs 0.4.0, answers one of six words (`PaymentVerdict`), takes a `HeaderService` trait, fails closed without one, and refuses nothing for its size |
+| **axum_layer** (feature `axum`) | `require_payment` (the gate, which streams a payment sent in the request body) and the `VerifiedPayment` extractor for Axum 0.8 |
 | **transport** | BRC-104 header constants, binary payload serialization (varints) |
 | **types** | `AuthContext`, `StoredSession`, `BsvPayment`, `PaymentContext` |
 | **error** | `AuthError` with HTTP status codes and machine-readable error codes |
@@ -52,9 +52,10 @@ use bsv_middleware_rs::{brc29_locking_script, verify_payment, PaymentToVerify, P
 
 let script = brc29_locking_script(&wallet, &prefix, &suffix, &sender_identity_key)?;
 let verdict = verify_payment(
-    &PaymentToVerify { transaction: &beef, output_index: 0, expected_script: &script, required_satoshis: 100 },
+    &PaymentToVerify { output_index: 0, expected_script: &script, required_satoshis: 100 },
+    &beef[..],                // any std::io::Read: a slice, a file, a decoder over a transport
     Some(&my_header_service), // None answers NoHeaderService: a server fault
-).await;
+).await?;                     // Err is the source's failure, never a verdict on the payment
 match verdict {
     PaymentVerdict::Verified { satoshis } => { /* internalize, then serve */ }
     PaymentVerdict::Underpaid { .. } | PaymentVerdict::WrongScript { .. } => { /* 402, a fresh challenge */ }
@@ -63,6 +64,10 @@ match verdict {
     PaymentVerdict::Unverifiable(reason) => { /* 503 if reason.is_server_side(), else 400 */ }
 }
 ```
+
+A body that arrives in chunks (a request body, an object store's body stream) implements
+`AsyncByteSource`, the trait bsv-rs 0.4.0 ships, and goes through `verify_payment_async`: the same
+checks, the same words.
 
 The six words are the whole answer; `PaymentVerdict` is exhaustive, so a host handles each in one
 match with no catch-all arm:
@@ -97,16 +102,30 @@ impl HeaderService for MyHeaders {
 `header_service_url` reads a configured base URL and answers `None` for a value that names no
 service (unset, blank, a `.invalid` host): pass `None` to `verify_payment` then.
 
-Before it parses, the verifier refuses a payment over `MAX_PAYMENT_BYTES` (4 MiB) and a BEEF whose
-counts exceed `PAYMENT_BEEF_LIMITS` (128 transactions, 32 BUMPs): `Unverifiable` with
-`PaymentTooLarge`, `BeefTransactionsExceeded` or `BeefBumpsExceeded`, each naming the count and the
-bound. `verify_payment_with_limits` and `verify_payment_output_only_with_limits` take a caller's own
-budgets. `UnverifiableReason` and `AuthError` are `#[non_exhaustive]`: match them with a catch-all
-arm.
+### A payment of any size
 
-The rule is pinned by `tests/vectors/brc29-payment-vectors.json` (20 cases, 20 exact), run by
+A valid payment is never refused for its size or its counts. The payment is read once, as a stream,
+through `verify_stream` of bsv-rs 0.4.0: the verifier holds one element of the BEEF (one
+transaction, one BUMP) and the reader's index (about 128 bytes an element), never the BEEF. Read
+from a source that writes itself, a payment of 100,000 unproven transactions under one proven
+parent (6.2 MB) is verified with a peak heap of 12.8 MB, 2,684 bytes over the SDK reader's own, and
+the output check alone holds 16,988 bytes at every depth (`tests/payment_flat_memory.rs`). The crate
+exports no bound: `MAX_PAYMENT_BYTES`, `PAYMENT_BEEF_LIMITS` and the `_with_limits` verifiers of
+0.2.2 and 0.3.0 are gone.
+
+A refusal is for invalid bytes and names them: `Unverifiable(InvalidBeef { offset, kind, reason })`
+carries the stream offset of the byte and one of the reader's eighteen kinds (`Kind`: a truncated
+field, a tree height over 64, an input that names no earlier transaction, a subject that is not the
+tip, ...), none of which is a size or a count. `SpendRefused` is the script interpreter's refusal
+of an unproven transaction's spend: since 0.4.0 the full check runs the scripts of every unproven
+transaction against the parent output the BEEF carries. `NoProof` is a valid BEEF that gives no
+root to check. `UnverifiableReason` and `AuthError` are `#[non_exhaustive]`: match them with a
+catch-all arm.
+
+The rule is pinned by `tests/vectors/brc29-payment-vectors.json` (22 cases, 22 exact), run by
 `cargo test --test conformance_brc29`. `verify_payment_output_only` is the output check without SPV,
-for a host whose next step verifies the transaction itself; it is opted into by name.
+for a host whose next step verifies the transaction itself; it is opted into by name, reads a raw
+transaction as well as a BEEF, and keeps no index.
 
 ## Example: Axum server
 

@@ -112,13 +112,14 @@ jobs:
           restore-keys: |
             ubuntu-vectors-
 
-      # The BRC-29 conformance vectors (20 cases, a byte-pinned copy under
-      # tests/vectors/) since 0.3.0, beside the payment-bound and payment
-      # tests; the context name `vectors` is stable.
+      # The BRC-29 conformance vectors (22 cases, a byte-pinned copy under
+      # tests/vectors/), beside the any-size witnesses (0.2.2's payment-bound
+      # tests, inverted in 0.4.0) and the payment tests; the context name
+      # `vectors` is stable.
       - name: Run the BRC-29 conformance vectors
         run: cargo test --test conformance_brc29
 
-      - name: Run the payment-bound tests
+      - name: Run the any-size payment witnesses
         run: cargo test --test payment_limits
 
       - name: Run the payment module tests
