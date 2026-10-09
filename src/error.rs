@@ -6,7 +6,11 @@
 use thiserror::Error;
 
 /// Error type for BSV auth and payment middleware.
+///
+/// Non-exhaustive: a variant may be added in a minor release, so a match on
+/// it carries a catch-all arm.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum AuthError {
     // Auth errors (match auth-express-middleware)
     /// Authentication is required but not provided.
