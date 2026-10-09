@@ -35,14 +35,10 @@ use bsv_middleware_rs::payment::{
 use bsv_middleware_rs::transport::{
     auth_headers, build_request_payload, filter_signable_headers, HttpResponseData,
 };
-use bsv_middleware_rs::{
-    sign_message, verify_message_signature, SessionStorage, StoredSession,
-};
+use bsv_middleware_rs::{sign_message, verify_message_signature, SessionStorage, StoredSession};
 use bsv_rs::auth::{AuthMessage, MessageType, AUTH_VERSION};
 use bsv_rs::primitives::PrivateKey;
-use bsv_rs::wallet::{
-    Counterparty, CreateSignatureArgs, ProtoWallet, Protocol, SecurityLevel,
-};
+use bsv_rs::wallet::{Counterparty, CreateSignatureArgs, ProtoWallet, Protocol, SecurityLevel};
 use bsv_rs::PublicKey;
 use serde_json::json;
 use tokio::sync::RwLock;
@@ -197,7 +193,10 @@ async fn auth_handshake(State(state): State<Arc<AppState>>, body: Bytes) -> Resp
         auth_headers::IDENTITY_KEY,
         server_key.to_hex().parse().unwrap(),
     );
-    headers.insert(auth_headers::MESSAGE_TYPE, "initialResponse".parse().unwrap());
+    headers.insert(
+        auth_headers::MESSAGE_TYPE,
+        "initialResponse".parse().unwrap(),
+    );
     headers.insert("content-type", "application/json".parse().unwrap());
 
     let body = serde_json::to_string(&resp).unwrap();
@@ -230,7 +229,11 @@ async fn require_auth(
     }
 
     // Extract BRC-104 headers
-    let hdr = |name: &str| hdrs.get(name).and_then(|v| v.to_str().ok()).map(String::from);
+    let hdr = |name: &str| {
+        hdrs.get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from)
+    };
     let identity_hex = require_hdr!(hdr(auth_headers::IDENTITY_KEY), "Missing identity key");
     let sig_hex = require_hdr!(hdr(auth_headers::SIGNATURE), "Missing signature");
     let req_id_b64 = require_hdr!(hdr(auth_headers::REQUEST_ID), "Missing request ID");
@@ -252,14 +255,12 @@ async fn require_auth(
     // Look up session — your_nonce is the server's session nonce
     let session = match &your_nonce {
         Some(yn) => state.sessions.get_session(yn).await.ok().flatten(),
-        None => {
-            state
-                .sessions
-                .get_session_by_identity(&identity_hex)
-                .await
-                .ok()
-                .flatten()
-        }
+        None => state
+            .sessions
+            .get_session_by_identity(&identity_hex)
+            .await
+            .ok()
+            .flatten(),
     };
     let session = match session {
         Some(s) if s.is_authenticated => s,
@@ -291,7 +292,8 @@ async fn require_auth(
     };
 
     // Build BRC-104 binary payload and verify signature
-    let payload = build_request_payload(&request_id, &method, &path, &query, &signable, &body_bytes);
+    let payload =
+        build_request_payload(&request_id, &method, &path, &query, &signable, &body_bytes);
 
     let peer_key = match PublicKey::from_hex(&identity_hex) {
         Ok(k) => k,
@@ -306,9 +308,7 @@ async fn require_auth(
 
     match verify_message_signature(&state.wallet, &auth_msg, &session) {
         Ok(true) => {}
-        Ok(false) => {
-            return err_json(StatusCode::UNAUTHORIZED, "ERR_AUTH", "Signature invalid")
-        }
+        Ok(false) => return err_json(StatusCode::UNAUTHORIZED, "ERR_AUTH", "Signature invalid"),
         Err(e) => {
             return err_json(
                 StatusCode::UNAUTHORIZED,

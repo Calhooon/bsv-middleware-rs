@@ -9,7 +9,6 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum AuthError {
     // Auth errors (match auth-express-middleware)
-
     /// Authentication is required but not provided.
     #[error("Mutual-authentication failed!")]
     Unauthorized,
@@ -23,7 +22,6 @@ pub enum AuthError {
     SessionNotFound(String),
 
     // Payment errors (match payment-express-middleware)
-
     /// Payment middleware was run before auth middleware.
     #[error("The payment middleware must be executed after the Auth middleware.")]
     ServerMisconfigured,
@@ -33,7 +31,9 @@ pub enum AuthError {
     PaymentInternal(String),
 
     /// Payment is required to access this resource.
-    #[error("A BSV payment is required to complete this request. Provide the X-BSV-Payment header.")]
+    #[error(
+        "A BSV payment is required to complete this request. Provide the X-BSV-Payment header."
+    )]
     PaymentRequired {
         /// Amount required in satoshis.
         satoshis: u64,
@@ -58,7 +58,6 @@ pub enum AuthError {
     InvalidPayment(String),
 
     // Infrastructure errors
-
     /// Error interacting with storage backend.
     #[error("Storage error: {0}")]
     StorageError(String),
@@ -163,11 +162,21 @@ mod tests {
     #[test]
     fn test_status_codes_match_express() {
         assert_eq!(AuthError::Unauthorized.status_code(), 401);
-        assert_eq!(AuthError::InvalidAuthentication("x".into()).status_code(), 401);
+        assert_eq!(
+            AuthError::InvalidAuthentication("x".into()).status_code(),
+            401
+        );
         assert_eq!(AuthError::SessionNotFound("x".into()).status_code(), 401);
         assert_eq!(AuthError::ServerMisconfigured.status_code(), 500);
         assert_eq!(AuthError::PaymentInternal("x".into()).status_code(), 500);
-        assert_eq!(AuthError::PaymentRequired { satoshis: 100, derivation_prefix: "x".into() }.status_code(), 402);
+        assert_eq!(
+            AuthError::PaymentRequired {
+                satoshis: 100,
+                derivation_prefix: "x".into()
+            }
+            .status_code(),
+            402
+        );
         assert_eq!(AuthError::MalformedPayment("x".into()).status_code(), 400);
         assert_eq!(AuthError::InvalidDerivationPrefix.status_code(), 400);
         assert_eq!(AuthError::PaymentFailed("x".into()).status_code(), 400);
@@ -177,9 +186,22 @@ mod tests {
     #[test]
     fn test_error_codes_match_express() {
         assert_eq!(AuthError::Unauthorized.error_code(), "UNAUTHORIZED");
-        assert_eq!(AuthError::ServerMisconfigured.error_code(), "ERR_SERVER_MISCONFIGURED");
-        assert_eq!(AuthError::PaymentRequired { satoshis: 100, derivation_prefix: "x".into() }.error_code(), "ERR_PAYMENT_REQUIRED");
-        assert_eq!(AuthError::InvalidDerivationPrefix.error_code(), "ERR_INVALID_DERIVATION_PREFIX");
+        assert_eq!(
+            AuthError::ServerMisconfigured.error_code(),
+            "ERR_SERVER_MISCONFIGURED"
+        );
+        assert_eq!(
+            AuthError::PaymentRequired {
+                satoshis: 100,
+                derivation_prefix: "x".into()
+            }
+            .error_code(),
+            "ERR_PAYMENT_REQUIRED"
+        );
+        assert_eq!(
+            AuthError::InvalidDerivationPrefix.error_code(),
+            "ERR_INVALID_DERIVATION_PREFIX"
+        );
     }
 
     #[test]

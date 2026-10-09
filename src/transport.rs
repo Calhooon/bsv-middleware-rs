@@ -236,7 +236,10 @@ mod tests {
             ("x-bsv-payment".to_string(), "data".to_string()),
             ("x-bsv-auth-signature".to_string(), "sig".to_string()),
             ("authorization".to_string(), "Bearer tok".to_string()),
-            ("content-type".to_string(), "application/json; charset=utf-8".to_string()),
+            (
+                "content-type".to_string(),
+                "application/json; charset=utf-8".to_string(),
+            ),
             ("x-random".to_string(), "ignored".to_string()),
         ];
         let result = filter_signable_headers(&headers);
