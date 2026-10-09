@@ -16,7 +16,7 @@ exclude = ["/.github/", "/RELEASING.md", "/CLAUDE.md"]
 [dependencies]
 # BSV SDK - provides auth protocol, wallet, key derivation, and the streaming
 # BEEF reader the payment door reads through (0.4.0: `verify_stream`).
-bsv-rs = { version = "0.4.0", features = ["auth", "wallet", "transaction"] }
+bsv-rs = { version = "0.4.1", features = ["auth", "wallet", "transaction"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
