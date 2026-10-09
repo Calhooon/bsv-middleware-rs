@@ -1,47 +1,46 @@
 //! The BRC-29 payment conformance vectors, run against this crate.
 //!
-//! `conformance/brc29-payment-vectors.json` is copied byte for byte from
-//! `bsv-middleware-cloudflare@dabfb78 conformance/brc29-payment-vectors.json`
-//! (sha256 d36abf96399f6e5b654ded3d6a04d20c6a504ff135aa9c27880dc1b2e5fef176);
-//! its README there gives the schema and the run recipe. Never edit it by hand.
+//! `tests/vectors/brc29-payment-vectors.json` is a byte-pinned copy of the
+//! canonical file, `conformance/brc29-payment-vectors.json` of the stack
+//! review repository (bsv-stack-lean), which owns the vectors; its README
+//! there gives the schema and the run recipe. Never edit the copy by hand: a
+//! change starts in the canonical file and the copy follows, with
+//! `VECTORS_SHA256` below. `the_vectors_are_the_pinned_bytes` holds the copy
+//! to that digest wherever the tests run, and
+//! `the_pinned_copy_is_the_canonical_file` compares it byte for byte with the
+//! canonical file when that checkout is present (`BRC29_VECTORS_CANONICAL`,
+//! else a sibling `bsv-stack-lean`), and says so when it is not.
 //!
 //! Every case: the derivation through `brc29_locking_script`; the configured
 //! URL through `header_service_url` (a `config` case must name no service);
 //! the payment through `verify_payment` with the header service replaced by a
 //! stub answering from `header_service.lookup`; `output` cases also through
 //! `verify_payment_output_only`. The verdict is mapped onto the vector words
-//! and compared with `expected` exactly.
-//!
-//! One case diverges by design and is declared below: the vectors' sixth word
-//! is `AcceptedUnverified` (fail open when the header service cannot answer);
-//! Rule 27 (epoch `NETWORK-ENFORCEMENT-RULES.md` at 2f4ef72) has `Unverifiable`
-//! in its place and fails closed. The runner requires that case to answer
-//! exactly the declared word, and fails if the declaration goes stale.
+//! and compared with `expected` exactly: 20 of 20, no declared divergence.
+//! The file's `rulings` list records the ruling of 2026-10-08 that
+//! `spv-lookup-error` is `Unverifiable` (fail closed when the header service
+//! cannot answer), which is what this crate answers.
 
 use async_trait::async_trait;
 use bsv_middleware_rs::{
     brc29_locking_script, header_service_url, verify_payment, verify_payment_output_only,
     HeaderLookupError, HeaderService, PaymentToVerify, PaymentVerdict, UnverifiableReason,
 };
-use bsv_rs::primitives::PrivateKey;
+use bsv_rs::primitives::{sha256, PrivateKey};
 use bsv_rs::wallet::ProtoWallet;
 use serde_json::{json, Value};
 use std::sync::Mutex;
 
-const VECTORS: &str = include_str!("../conformance/brc29-payment-vectors.json");
+const VECTORS: &str = include_str!("vectors/brc29-payment-vectors.json");
 
-/// Cases whose expected word this crate answers differently on purpose:
-/// (case, the vector's word, this crate's word and fields).
-fn declared_divergences() -> Vec<(&'static str, &'static str, Observed)> {
-    vec![(
-        "spv-lookup-error",
-        "AcceptedUnverified",
-        observed(
-            "Unverifiable",
-            json!({ "reason": "HeaderLookupFailed", "height": 850000 }),
-        ),
-    )]
-}
+/// The sha256 of the pinned copy (the canonical file's bytes).
+const VECTORS_SHA256: &str = "dae68f0b2999b44088e67206b1c34866a2c3f0fee8f0a8c8f4829d313ba13a8d";
+
+/// Where the canonical file is, when its checkout sits beside this one.
+const CANONICAL_SIBLING: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../bsv-stack-lean/conformance/brc29-payment-vectors.json"
+);
 
 /// What the crate answered, as a vector word and its fields.
 #[derive(Debug, Clone, PartialEq)]
@@ -77,11 +76,10 @@ fn word(verdict: PaymentVerdict) -> Observed {
             "RootMismatch",
             json!({ "height": height, "merkle_root": merkle_root }),
         ),
+        // The vectors give `Unverifiable` the height of the first root whose
+        // lookup failed, and nothing else.
         PaymentVerdict::Unverifiable(UnverifiableReason::HeaderLookupFailed { height, .. }) => {
-            observed(
-                "Unverifiable",
-                json!({ "reason": "HeaderLookupFailed", "height": height }),
-            )
+            observed("Unverifiable", json!({ "height": height }))
         }
         PaymentVerdict::Unverifiable(reason) => {
             observed("Unverifiable", json!({ "reason": format!("{:?}", reason) }))
@@ -183,15 +181,48 @@ async fn run_case(case: &Value) -> Observed {
     got
 }
 
+#[test]
+fn the_vectors_are_the_pinned_bytes() {
+    assert_eq!(
+        hex::encode(sha256(VECTORS.as_bytes())),
+        VECTORS_SHA256,
+        "tests/vectors/brc29-payment-vectors.json is stale or hand-edited: it is a copy of the \
+         canonical file; copy that file again and update VECTORS_SHA256 in the same change"
+    );
+}
+
+/// The copy is the canonical file, byte for byte. A hosted runner has no
+/// checkout of the canonical repository: there the digest above is the pin
+/// and this test says that it compared nothing.
+#[test]
+fn the_pinned_copy_is_the_canonical_file() {
+    let path =
+        std::env::var("BRC29_VECTORS_CANONICAL").unwrap_or_else(|_| CANONICAL_SIBLING.to_string());
+    match std::fs::read(&path) {
+        Ok(canonical) => assert!(
+            canonical == VECTORS.as_bytes(),
+            "tests/vectors/brc29-payment-vectors.json differs from the canonical file {path}"
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("no canonical file at {path}; the copy is held by its sha256 alone");
+        }
+        Err(e) => panic!("cannot read {path}: {e}"),
+    }
+}
+
 #[tokio::test]
 async fn every_vector_case() {
     let file: Value = serde_json::from_str(VECTORS).unwrap();
     assert_eq!(file["schema"], "brc29-payment-vectors/1");
     let cases = file["cases"].as_array().unwrap();
     assert_eq!(cases.len(), 20);
-    let divergences = declared_divergences();
+    assert_eq!(
+        file["words"].as_object().unwrap().len(),
+        6,
+        "six words in the glossary"
+    );
     let mut failures = Vec::new();
-    let (mut exact, mut declared) = (0, 0);
+    let mut exact = 0;
     for case in cases {
         let name = case["name"].as_str().unwrap();
         let expected = observed(
@@ -199,34 +230,23 @@ async fn every_vector_case() {
             case["expected"]["fields"].clone(),
         );
         let got = run_case(case).await;
-        let verdict = match divergences.iter().find(|(n, _, _)| *n == name) {
-            Some((_, vector_word, ours)) if expected.word == *vector_word && got == *ours => {
-                declared += 1;
-                "DECLARED"
-            }
-            Some(_) => "FAIL",
-            None if got == expected => {
-                exact += 1;
-                "ok"
-            }
-            None => "FAIL",
+        let verdict = if got == expected {
+            exact += 1;
+            "ok"
+        } else {
+            failures.push(name.to_string());
+            "FAIL"
         };
         println!(
             "{verdict:8} {name:40} expected {} {} got {} {}",
             expected.word, expected.fields, got.word, got.fields
         );
-        if verdict == "FAIL" {
-            failures.push(name.to_string());
-        }
     }
     println!(
-        "{exact} exact, {declared} declared divergence(s), {} failing",
+        "{exact} of {} exact, {} failing",
+        cases.len(),
         failures.len()
     );
     assert!(failures.is_empty(), "failing cases: {:?}", failures);
-    assert_eq!(
-        declared,
-        divergences.len(),
-        "a declared divergence went stale"
-    );
+    assert_eq!(exact, 20, "20 of 20 exact");
 }

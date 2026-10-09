@@ -833,10 +833,10 @@
       "derivation_suffix": "YnJjMjktY29uZm9ybWFuY2Utc3VmZml4",
       "description": "The header service cannot answer (HTTP 503).",
       "expected": {
+        "word": "Unverifiable",
         "fields": {
-          "satoshis": 1000
-        },
-        "word": "AcceptedUnverified"
+          "height": 850000
+        }
       },
       "expected_locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
       "header_service": {
@@ -847,7 +847,7 @@
         "url": "https://headers.example"
       },
       "name": "spv-lookup-error",
-      "note": "Fail-open: the crate returns Ok(satoshis) and logs a warning; the root was NOT checked. The word says so; the API result alone cannot tell this from Verified.",
+      "note": "Fail closed (ruled 2026-10-08): the header service errored at height 850000, so the root was not checked and the payment is refused as Unverifiable; fields.height names the height to re-ask (the first erroring root in height order). crate_result is the 0.3.6 producer's answer: it returned Ok(satoshis) and logged a warning (fail open); 0.3.9 and 0.4.x refuse.",
       "output_index": 0,
       "required_satoshis": 1000,
       "requires_merkle_lookup": true,
@@ -887,11 +887,20 @@
   "producer": "bsv-middleware-cloudflare 0.3.6 tests/conformance_brc29.rs build_vectors (fixed synthetic inputs; regenerate, never retype)",
   "schema": "brc29-payment-vectors/1",
   "words": {
-    "AcceptedUnverified": "Accept, but the header service could not answer so the merkle root was NOT checked (fail-open). fields.satoshis.",
     "NoHeaderService": "Refuse before any other check: no usable header service is configured (fail-closed misconfiguration).",
     "RootMismatch": "Refuse: the header at the proof's height carries a different merkle root (fail-closed fraud signal). fields.height, fields.merkle_root (the proof's root).",
     "Underpaid": "Refuse: the output pays the derived key less than required. fields.paid, fields.required.",
+    "Unverifiable": "Refuse: a merkle root could not be checked (fail-closed): the header service errored at fields.height (the first such height in height order), or the BEEF carries no proof at all (no fields).",
     "Verified": "Accept. fields.satoshis = the output's satoshis.",
     "WrongScript": "Refuse: the output's locking script is not the expected one. fields.expected_script, fields.actual_script."
-  }
+  },
+  "rulings": [
+    {
+      "date": "2026-10-08",
+      "case": "spv-lookup-error",
+      "word": "Unverifiable",
+      "by": "the owner",
+      "why": "fail closed on a header lookup error (the agents side's epoch Rule 27; the north star's second and fifth tests); the Cloudflare crate fails closed in 0.3.9"
+    }
+  ]
 }
