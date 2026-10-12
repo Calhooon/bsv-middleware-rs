@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- bsv-rs 0.4.5: the lone leaf at offset 0 only; the LOCAL work bound; no behavior change under the defaults.
+
 ## [0.4.1] - 2026-10-09
 
 - bsv-rs 0.4.1: a transaction with no input is invalid bytes. Under
