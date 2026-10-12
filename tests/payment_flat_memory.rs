@@ -128,10 +128,14 @@ fn the_door_reads_100_000_unproven_links_with_flat_memory() {
 
     // The output check: one chunk and one element at any depth.
     let (_, _, _, first, ..) = rows[0];
+    // The rule: the peak does not grow with the depth. Equality was too strict
+    // for an allocator's first-touch cost (a hosted runner measured 900 bytes
+    // more at the first depth than at the deeper ones, bsv-middleware-rs #8);
+    // a 4 KiB band around the first measurement states the rule and no more.
     for (links, _, _, output_only, ..) in &rows {
-        assert_eq!(
-            *output_only, first,
-            "the output check's peak moved with the depth at {links} links"
+        assert!(
+            output_only.abs_diff(first) <= 4096,
+            "the output check's peak moved with the depth at {links} links: {output_only} against {first}"
         );
         assert!(*output_only < 64 * 1024, "more than a chunk and an element");
     }
