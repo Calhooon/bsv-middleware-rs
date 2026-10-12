@@ -60,7 +60,7 @@ use bsv_rs::transaction::{
 use bsv_rs::wallet::{Counterparty, GetPublicKeyArgs, ProtoWallet, Protocol, SecurityLevel};
 use std::io::Read;
 
-pub use bsv_rs::transaction::beef_stream::SpendRefusal;
+pub use bsv_rs::transaction::beef_stream::{MiningCheck, SpendRefusal};
 pub use bsv_rs::transaction::{AsyncByteSource, Kind, Reason};
 
 /// The BRC-29 payment protocol name (security level 2), the protocol the
@@ -120,6 +120,18 @@ pub enum PaymentVerdict {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum UnverifiableReason {
+    /// The verifier has no mining tip for a contextual check. A server
+    /// integration fault (5xx), never an invalid transaction verdict.
+    MiningContextUnavailable {
+        /// Transaction or input offset.
+        offset: u64,
+        /// Spending transaction in display hex.
+        txid: String,
+        /// Input, when named.
+        input: Option<u32>,
+        /// Check whose context is absent.
+        check: MiningCheck,
+    },
     /// The BEEF's bytes are invalid: the offset of the byte and one of the
     /// streaming reader's eighteen kinds (bsv-rs 0.4.0, the Lean definition
     /// `BeefOfAnySize`). The reading stopped there.
@@ -177,7 +189,10 @@ pub enum UnverifiableReason {
 impl UnverifiableReason {
     /// True when the server, not the payment, is why it cannot be verified.
     pub fn is_server_side(&self) -> bool {
-        matches!(self, Self::HeaderLookupFailed { .. })
+        matches!(
+            self,
+            Self::HeaderLookupFailed { .. } | Self::MiningContextUnavailable { .. }
+        )
     }
 
     fn invalid(refusal: Refusal) -> Self {
@@ -225,6 +240,9 @@ impl std::fmt::Display for PaymentVerdict {
 impl std::fmt::Display for UnverifiableReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::MiningContextUnavailable { offset, txid, input, check } => {
+                write!(f, "mining context unavailable for {:?}: transaction {} at offset {} input {:?}", check, txid, offset, input)
+            }
             Self::InvalidBeef { offset, kind, .. } => {
                 write!(f, "BEEF is invalid at offset {}: {:?}", offset, kind)
             }
@@ -584,6 +602,19 @@ impl<'p> Tap<'p> {
         } = self;
         let roots = match verdict {
             Verdict::Valid { roots, .. } => roots,
+            Verdict::Unverifiable {
+                offset,
+                txid,
+                input,
+                check,
+            } => {
+                return PaymentVerdict::Unverifiable(UnverifiableReason::MiningContextUnavailable {
+                    offset,
+                    txid: display_hex(&txid),
+                    input,
+                    check,
+                })
+            }
             Verdict::Invalid {
                 offset,
                 kind,
@@ -908,7 +939,11 @@ mod tests {
     /// A crafted payment spending a crafted, unproven parent. Never signed,
     /// never broadcast.
     fn unproven_tx(outputs: &[(u64, Vec<u8>)]) -> Transaction {
-        let parent = coinbase(&[(10_000, p2pkh(&[7u8; 20]))]);
+        let mut parent = coinbase(&[(10_000, p2pkh(&[7u8; 20]))]);
+        // Output-only fixtures need a regular funding body; an unproven
+        // coinbase is invalid under SDK 0.5.0, even in structure-only mode.
+        parent.inputs[0].source_txid = Some("11".repeat(32));
+        parent.inputs[0].source_output_index = 0;
         let mut tx = Transaction::new();
         tx.add_input(TransactionInput::with_source_transaction(parent, 0))
             .unwrap();
@@ -1349,9 +1384,11 @@ mod tests {
             verify_payment_output_only(&payment(0, OP_TRUE), &under[..]).unwrap(),
             no_inputs(7)
         );
-        // The control: the same parent in the coinbase shape is past this
-        // rule, and its null outpoint names no element of the BEEF.
-        let parent = coinbase(&[(PRICE, OP_TRUE.to_vec())]);
+        // The control: a regular funding parent is past this rule, but
+        // its non-null outpoint still names no element of the BEEF.
+        let mut parent = coinbase(&[(PRICE, OP_TRUE.to_vec())]);
+        parent.inputs[0].source_txid = Some("11".repeat(32));
+        parent.inputs[0].source_output_index = 0;
         let subject = spending(&parent, &[(PRICE, OP_TRUE.to_vec())]);
         let (under, _) = beef_of(&[&parent, &subject], false);
         assert!(matches!(
