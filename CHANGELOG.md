@@ -2,7 +2,11 @@
 
 ## [Unreleased]
 
-## [0.4.2] - 2026-10-12
+## [0.4.3] - 2026-10-12
+
+The release of 0.4.2 never published (its release run failed on the heap-peak fixture that #9 fixed, and a `v*` tag cannot be deleted under the repository's rules); 0.4.3 is the same re-pin plus that test fix.
+
+## [0.4.2] - 2026-10-12 (not published)
 
 bsv-rs 0.4.5 (the lone leaf at offset 0 only; the LOCAL work bound inside one input's script); no behavior change under the defaults. The L2 re-pin of bsv-stack-lean item 2.
 
