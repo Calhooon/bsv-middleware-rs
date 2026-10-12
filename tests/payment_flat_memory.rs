@@ -8,10 +8,14 @@
 //!
 //! - the output check alone: one chunk and one element, the same peak at
 //!   every depth;
-//! - the SDK's `verify_stream` alone (bsv-rs 0.4.0): its index, a bounded
+//! - the SDK's `verify_stream` alone: its index, a bounded
 //!   number of bytes per element;
 //! - the door's full check: the SDK's reading plus a constant (a second
 //!   element in hand), never a byte that grows with the depth.
+//!
+//! At 100,000 links a second body pads every unproven locking script with 4 KiB.
+//! Equal element counts with very different body sizes must have heap peaks
+//! within a constant band, in addition to the measured per-link ceiling.
 //!
 //! One test, so the profiles do not overlap.
 
@@ -29,10 +33,20 @@ use bsv_middleware_rs::{
     PaymentVerdict,
 };
 use bsv_rs::transaction::verify_stream;
-use support::beef_chain::{funding_root, ChainSource, HEIGHT, OP_TRUE, SATS};
+use support::beef_chain::{funding_root, padded_lock, ChainSource, HEIGHT, OP_TRUE, SATS};
 
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
+
+// bsv-rs 0.5.0 measured 17,518,420 B / 100,000 links = 175.1842 B/link
+// in this harness. 192 leaves 9.6% for runner variation while tightening the
+// existing SDK ceiling (320 B/element plus one 64 KiB chunk). It is a heap
+// regression witness, never an acceptance limit on a payment.
+const MAX_BYTES_PER_LINK: u64 = 192;
+// The existing one-element/chunk allowance: independent of the total body's
+// bytes. A 4 KiB locking script may change transient element allocations, not the index.
+const BODY_FLATNESS_BAND: u64 = 64 * 1024;
+const OUTPUT_PADDING: usize = 4096;
 
 const PAYMENT: PaymentToVerify<'static> = PaymentToVerify {
     output_index: 0,
@@ -77,6 +91,15 @@ fn the_door_reads_100_000_unproven_links_with_flat_memory() {
         asked: Mutex::new(Vec::new()),
     };
     let paid = PaymentVerdict::Verified { satoshis: SATS };
+
+    // Check the padded parent is spendable before the long heap profiles.
+    assert!(verify_stream(
+        ChainSource::with_output_padding(3, OUTPUT_PADDING),
+        HashMap::from([(HEIGHT, funding_root())]),
+        None,
+    )
+    .unwrap()
+    .is_valid());
 
     println!("\n=== the payment door, the P0-5 deep chain ===");
     let mut rows = Vec::new();
@@ -139,7 +162,7 @@ fn the_door_reads_100_000_unproven_links_with_flat_memory() {
         );
         assert!(*output_only < 64 * 1024, "more than a chunk and an element");
     }
-    for (links, n, bytes, _, sdk, door) in &rows {
+    for (links, n, _, _, sdk, door) in &rows {
         // The door adds a constant to the SDK's reading: the tap's decoder
         // and the one element it holds.
         assert!(
@@ -153,11 +176,6 @@ fn the_door_reads_100_000_unproven_links_with_flat_memory() {
             (*door as f64) / (*n as f64) < 320.0 + 64.0 * 1024.0 / (*n as f64),
             "{links} links: {door} B"
         );
-        // Never the BEEF: at depth the peak is a fraction of the bytes read
-        // and an in-memory parse would hold all of them and more.
-        if *links >= 10_000 {
-            assert!(door * 2 < bytes * 7, "{links} links: {door} B of {bytes}");
-        }
     }
     // A hundred times the depth costs no more per element.
     let per = |i: usize| rows[i].5 as f64 / rows[i].1 as f64;
@@ -169,4 +187,44 @@ fn the_door_reads_100_000_unproven_links_with_flat_memory() {
     );
     // The bytes are the P0-5 chain's: 62 a link.
     assert_eq!(rows[2].2, 6_200_124);
+
+    let (links, n, small_bytes, _, _, small_heap) = rows[2];
+    assert!(small_heap < MAX_BYTES_PER_LINK * links as u64);
+    let padded_script = padded_lock(OUTPUT_PADDING);
+    let padded_payment = PaymentToVerify {
+        expected_script: &padded_script,
+        ..PAYMENT
+    };
+    let started = Instant::now();
+    let (large_heap, (verdict, large_bytes)) = peak(|| {
+        let mut source = ChainSource::with_output_padding(n, OUTPUT_PADDING);
+        let verdict = runtime
+            .block_on(verify_payment(&padded_payment, &mut source, Some(&headers)))
+            .unwrap();
+        (verdict, source.total)
+    });
+    assert_eq!(verdict, paid, "the padded body's full check");
+    assert_eq!(*headers.asked.lock().unwrap(), vec![HEIGHT as u32; 4]);
+    // The same proven funding and 100,000 links; only the locking scripts grew.
+    assert_eq!(large_bytes, small_bytes + links as u64 * 4102);
+    assert!(
+        large_bytes > small_bytes * 64,
+        "the bodies must differ greatly"
+    );
+    println!(
+        "  flatness: {links} links each; small {small_bytes} B / {small_heap} B heap; \
+         padded {large_bytes} B / {large_heap} B heap; delta {} B; {:.3} s",
+        large_heap.abs_diff(small_heap),
+        started.elapsed().as_secs_f64()
+    );
+    // These replace the body-byte ratio, which penalized small valid links
+    // without testing retention of body bytes. Neither bound grows with bytes.
+    assert!(
+        large_heap < MAX_BYTES_PER_LINK * links as u64,
+        "padded body: {large_heap} B exceeds {MAX_BYTES_PER_LINK} B/link"
+    );
+    assert!(
+        large_heap.abs_diff(small_heap) <= BODY_FLATNESS_BAND,
+        "equal counts: {small_heap} B vs {large_heap} B heap"
+    );
 }

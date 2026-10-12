@@ -53,6 +53,16 @@ pub fn spend(prev: &Hash32, outputs: usize) -> Vec<u8> {
     v
 }
 
+/// The OP_TRUE locking script with disposable data, for the body-flatness check.
+pub fn padded_lock(padding: usize) -> Vec<u8> {
+    assert!(padding <= u16::MAX as usize);
+    let mut script = vec![0x4d];
+    script.extend_from_slice(&(padding as u16).to_le_bytes());
+    script.resize(script.len() + padding, 0);
+    script.extend_from_slice(&[0x75, OP_TRUE]);
+    script
+}
+
 /// The proven funding transaction of the P0-5 chain.
 pub fn funding() -> Vec<u8> {
     spend(&[0xAA; 32], 2)
@@ -66,6 +76,7 @@ pub fn funding_root() -> Hash32 {
 /// The chain of `n` transactions as a BEEF V2, written as it is read.
 pub struct ChainSource {
     n: usize,
+    output_padding: usize,
     /// The transactions written so far.
     written: usize,
     prev: Hash32,
@@ -77,6 +88,13 @@ pub struct ChainSource {
 
 impl ChainSource {
     pub fn new(n: usize) -> Self {
+        Self::with_output_padding(n, 0)
+    }
+
+    /// Pad each unproven locking script with a push and OP_DROP before OP_TRUE.
+    /// The source still holds one transaction; the script result stays true.
+    pub fn with_output_padding(n: usize, output_padding: usize) -> Self {
+        assert!(output_padding <= u16::MAX as usize);
         assert!(n >= 1);
         // The version word, one BUMP (the coinbase shape: one level, the one
         // leaf at offset 0 flagged as a txid), the transaction count.
@@ -88,6 +106,7 @@ impl ChainSource {
         piece.extend(varint(n as u64));
         Self {
             n,
+            output_padding,
             written: 0,
             prev: [0u8; 32],
             piece,
@@ -108,7 +127,19 @@ impl ChainSource {
             funding()
         } else {
             self.piece.push(0);
-            spend(&self.prev, 1)
+            let mut raw = spend(&self.prev, 1);
+            if self.output_padding != 0 {
+                // Replace the one-byte output script at byte 56. The
+                // unlocking script stays empty (push-only); each parent
+                // locking script drops its padding before yielding true.
+                let script = padded_lock(self.output_padding);
+                let mut padded = raw[..55].to_vec();
+                padded.extend(varint(script.len() as u64));
+                padded.extend_from_slice(&script);
+                padded.extend_from_slice(&raw[57..]);
+                raw = padded;
+            }
+            raw
         };
         self.prev = sha256d(&raw);
         self.piece.extend_from_slice(&raw);

@@ -2,6 +2,8 @@
 
 ## [0.4.4] - 2026-10-12
 
+- State the flat-memory witness as a measured per-link band and equal-count body flatness, retaining the output-check and SDK-overhead checks.
+
 - Preserve the SDK's missing mining context decline as `Unverifiable(MiningContextUnavailable)` with its offset, transaction, input and check. It is a server integration fault (503 at the Axum door), never invalid bytes or an accepted payment. The existing header adapter supplies no mining tip; non-final time locks and coinbase spends requiring that context fail closed.
 - Replay all 22 canonical payment cases through Axum with synthetic issued-challenge fixtures, retaining their amounts, output order and header-answer classes.
 
