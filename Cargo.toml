@@ -1,6 +1,6 @@
 [package]
 name = "bsv-middleware-rs"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2021"
 authors = ["John Calhoun <dev@calhounjohn.com>"]
 description = "Framework-agnostic BRC-31 authentication and BRC-29 payment middleware for BSV"
@@ -16,7 +16,7 @@ exclude = ["/.github/", "/RELEASING.md", "/CLAUDE.md"]
 [dependencies]
 # BSV SDK - provides auth protocol, wallet, key derivation, and the streaming
 # BEEF reader the payment door reads through (0.4.0: `verify_stream`).
-bsv-rs = { version = "=0.4.5", features = ["auth", "wallet", "transaction"] }
+bsv-rs = { version = "0.5.0", features = ["auth", "wallet", "transaction"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

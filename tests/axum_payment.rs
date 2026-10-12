@@ -682,3 +682,139 @@ async fn no_header_service_is_answered_before_the_body_is_read() {
     assert_eq!(body["code"], "ERR_SERVER_MISCONFIGURED");
     assert!(!polled.load(Ordering::SeqCst), "the body was read");
 }
+
+/// Replay all canonical cases at the HTTP door. The wire fixtures use a
+/// static derivation prefix that is not an issued challenge. Rebuild only
+/// the synthetic payment scripts and their proof roots for a fresh challenge,
+/// preserving amounts, output order, wrong scripts and header-answer classes.
+#[tokio::test]
+async fn all_22_vector_cases_reach_the_axum_door() {
+    let vectors: Value =
+        serde_json::from_str(include_str!("vectors/brc29-payment-vectors.json")).unwrap();
+    let cases = vectors["cases"].as_array().unwrap();
+    assert_eq!(cases.len(), 22);
+    for case in cases {
+        let name = case["name"].as_str().unwrap();
+        let server = wallet(case["server_private_key"].as_str().unwrap());
+        let prefix = create_derivation_prefix(&server).unwrap();
+        let sender = case["sender_identity_key"].as_str().unwrap();
+        let suffix = case["derivation_suffix"].as_str().unwrap();
+        let script =
+            bsv_middleware_rs::brc29_locking_script(&server, &prefix, suffix, sender).unwrap();
+        let mut tx = Transaction::new();
+        tx.add_input(TransactionInput::new("11".repeat(32), 0))
+            .unwrap();
+        for output in case["transaction"]["outputs"].as_array().unwrap() {
+            let original = output["locking_script"].as_str().unwrap();
+            let locking = if original == case["expected_locking_script"].as_str().unwrap() {
+                script.clone()
+            } else {
+                hex::decode(original).unwrap()
+            };
+            tx.add_output(TransactionOutput::new(
+                output["satoshis"].as_u64().unwrap(),
+                LockingScript::from_binary(&locking).unwrap(),
+            ))
+            .unwrap();
+        }
+        let root = tx.id();
+        let mut beef = Beef::new();
+        if !case["transaction"]["proof"].is_null() {
+            beef.merge_bump(
+                MerklePath::new(
+                    HEIGHT,
+                    vec![vec![MerklePathLeaf::new_txid(0, root.clone())]],
+                )
+                .unwrap(),
+            );
+        }
+        beef.merge_transaction(tx);
+        let lookup = &case["header_service"]["lookup"];
+        let word = case["expected"]["word"].as_str().unwrap();
+        let headers = if case["stage"] == "config" {
+            None
+        } else {
+            let answer = if lookup["answer"] == "error" {
+                Err(HeaderLookupError("synthetic lookup failure".into()))
+            } else if word == "RootMismatch" {
+                Ok("00".repeat(32))
+            } else if name == "spv-root-match-uppercase" {
+                Ok(root.to_uppercase())
+            } else {
+                Ok(root.clone())
+            };
+            Some(Arc::new(StubHeaders(answer, Mutex::new(Vec::new()))) as Arc<dyn HeaderService>)
+        };
+        let gate = Arc::new(PaymentGate::new(
+            server,
+            case["required_satoshis"].as_u64().unwrap(),
+            headers,
+        ));
+        let served = Arc::new(AtomicUsize::new(0));
+        let count = served.clone();
+        let router = Router::new()
+            .route(
+                "/paid",
+                post(move |p: VerifiedPayment| async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(json!({"satoshis_paid": p.satoshis_paid}))
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(gate, require_payment));
+        let app = App { router, served };
+        let payment = json!({"derivationPrefix": prefix, "derivationSuffix": suffix, "transaction": B64.encode(beef.to_binary())}).to_string();
+        let (status, _, body) = send(&app, Some(sender), Some(payment)).await;
+        let expected = match word {
+            "Verified" => StatusCode::OK,
+            "Underpaid" | "WrongScript" => StatusCode::PAYMENT_REQUIRED,
+            "NoHeaderService" => StatusCode::INTERNAL_SERVER_ERROR,
+            "RootMismatch" => StatusCode::BAD_REQUEST,
+            "Unverifiable" if case["expected"]["fields"].get("height").is_some() => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            "Unverifiable" => StatusCode::BAD_REQUEST,
+            other => panic!("unexpected word {other}"),
+        };
+        assert_eq!(status, expected, "{name}: {body}");
+        assert_eq!(
+            app.served.load(Ordering::SeqCst),
+            usize::from(word == "Verified"),
+            "{name}"
+        );
+        if word == "Verified" {
+            assert_eq!(
+                body["satoshis_paid"], case["expected"]["fields"]["satoshis"],
+                "{name}"
+            );
+        }
+        println!("{name}: {status}");
+    }
+    println!("22 of 22 cases through the Axum door");
+}
+
+#[tokio::test]
+async fn missing_mining_context_is_503_and_never_served() {
+    let prefix = prefix();
+    let script = payer_script(SENDER_KEY, &prefix);
+    let (mut beef, root) = chain_beef(1, PRICE, &script, 0);
+    let subject_len = raw_tx(&[0; 32], PRICE, &script, 0).len();
+    let subject_at = beef.len() - subject_len;
+    beef[subject_at + 42..subject_at + 46].copy_from_slice(&0u32.to_le_bytes());
+    let end = beef.len();
+    beef[end - 4..].copy_from_slice(&1u32.to_le_bytes());
+    let app = app(headers_answering_root(&root));
+    let (status, _, body) = send_with_body(
+        &app,
+        Some(&identity(SENDER_KEY)),
+        Some(body_payment_header(&prefix)),
+        in_pieces(&beef, 7),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["code"], "ERR_PAYMENT_UNAVAILABLE");
+    assert!(
+        body["description"].as_str().unwrap().contains("Finality"),
+        "{body}"
+    );
+    assert_eq!(app.served.load(Ordering::SeqCst), 0);
+}

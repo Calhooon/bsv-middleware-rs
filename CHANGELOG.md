@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.4] - 2026-10-12
+
+- Preserve the SDK's missing mining context decline as `Unverifiable(MiningContextUnavailable)` with its offset, transaction, input and check. It is a server integration fault (503 at the Axum door), never invalid bytes or an accepted payment. The existing header adapter supplies no mining tip; non-final time locks and coinbase spends requiring that context fail closed.
+- Replay all 22 canonical payment cases through Axum with synthetic issued-challenge fixtures, retaining their amounts, output order and header-answer classes.
+
+- Declare `bsv-rs = "0.5.0"` by caret in the published libraries. The update loop can deliver compatible SDK patches to consumers without another library release; deployables keep their exact pins and committed locks.
+- Resolve bsv-rs 0.5.0, including its streaming mining checks. Stored BEEF and old BSC1 cursors require the SDK's revalidation or restart rules; no stored-data migration is performed here.
+
 ## [Unreleased]
 
 ## [0.4.3] - 2026-10-12
