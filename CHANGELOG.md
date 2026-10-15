@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.0] - 2026-10-15
+
+- bsv-rs 0.6.0, declared by caret (`bsv-rs = "0.6.0"`), is the home of the varint: every BRC-104 payload length and status is written by `bsv_rs::primitives::to_var_int`. The payload bytes are unchanged for every value the transport writes.
+- Breaking: `transport::write_varint` is removed; call `bsv_rs::primitives::to_var_int` (it takes a `u64`; the removed function wrote `[0]` for a negative value, which no payload field can be).
+- Breaking: the re-exported bsv-rs types (`Kind`, `Reason`, `AsyncByteSource`, `MiningCheck`, `SpendRefusal`) and `From<bsv_rs::Error>` now come from bsv-rs 0.6.0, a new compatibility line under cargo; a consumer moves bsv-rs and this crate together.
+- The stack's template `deny.toml` is adopted byte for byte: the crypto crates banned outside bsv-rs, advisories, licenses and sources, checked by `cargo deny check`.
+- The tests' own varint helpers and one hand-written BUMP height use bsv-rs's `to_var_int` too.
+
 ## [0.4.4] - 2026-10-12
 
 - State the flat-memory witness as a measured per-link band and equal-count body flatness, retaining the output-check and SDK-overhead checks.
