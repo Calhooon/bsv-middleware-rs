@@ -21,7 +21,7 @@ use bsv_middleware_rs::payment::{
 };
 use bsv_middleware_rs::payment_core::BRC29_PROTOCOL_NAME;
 use bsv_middleware_rs::{AuthContext, HeaderLookupError, HeaderService};
-use bsv_rs::primitives::{sha256d, PrivateKey, PublicKey};
+use bsv_rs::primitives::{sha256d, to_var_int, PrivateKey, PublicKey};
 use bsv_rs::script::LockingScript;
 use bsv_rs::transaction::{
     Beef, MerklePath, MerklePathLeaf, Transaction, TransactionInput, TransactionOutput,
@@ -421,14 +421,6 @@ fn in_pieces(bytes: &[u8], chunk: usize) -> Body {
     Body::from_stream(futures::stream::iter(pieces))
 }
 
-fn varint(n: u64) -> Vec<u8> {
-    match n {
-        0..=0xFC => vec![n as u8],
-        0xFD..=0xFFFF => [&[0xFD][..], &(n as u16).to_le_bytes()].concat(),
-        _ => [&[0xFE][..], &(n as u32).to_le_bytes()].concat(),
-    }
-}
-
 /// A raw transaction spending `source:0` with an empty unlock, paying
 /// `satoshis` to `script` and, when `padding` is not 0, a second output of no
 /// satoshis carrying `padding` bytes nothing spends.
@@ -441,11 +433,11 @@ fn raw_tx(source: &[u8; 32], satoshis: u64, script: &[u8], padding: usize) -> Ve
     v.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
     v.push(if padding == 0 { 1 } else { 2 });
     v.extend_from_slice(&satoshis.to_le_bytes());
-    v.extend(varint(script.len() as u64));
+    v.extend(to_var_int(script.len() as u64));
     v.extend_from_slice(script);
     if padding != 0 {
         v.extend_from_slice(&0u64.to_le_bytes());
-        v.extend(varint(padding as u64 + 7));
+        v.extend(to_var_int(padding as u64 + 7));
         v.extend_from_slice(&[0x00, 0x6a, 0x4e]);
         v.extend_from_slice(&(padding as u32).to_le_bytes());
         v.resize(v.len() + padding, 0xAB);
@@ -465,10 +457,10 @@ fn chain_beef(links: usize, satoshis: u64, script: &[u8], padding: usize) -> (Ve
     root.reverse();
     let mut v = 0xEFBE_0002u32.to_le_bytes().to_vec();
     v.push(1);
-    v.extend(varint(u64::from(HEIGHT)));
+    v.extend(to_var_int(u64::from(HEIGHT)));
     v.extend_from_slice(&[1, 1, 0, 2]);
     v.extend_from_slice(&prev);
-    v.extend(varint(links as u64 + 2));
+    v.extend(to_var_int(links as u64 + 2));
     v.extend_from_slice(&[1, 0]);
     v.extend_from_slice(&funding);
     for _ in 0..links {

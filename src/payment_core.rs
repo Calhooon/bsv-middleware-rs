@@ -1611,8 +1611,7 @@ mod tests {
         let txid = bsv_rs::primitives::sha256d(&raw);
         let mut v = BEEF_V2.to_le_bytes().to_vec();
         v.push(1);
-        v.push(0xFF);
-        v.extend_from_slice(&height.to_le_bytes());
+        v.extend(bsv_rs::primitives::to_var_int(height));
         v.extend_from_slice(&[1, 1, 0, 2]);
         v.extend_from_slice(&txid);
         v.extend_from_slice(&[1, 1, 0]);
@@ -1639,7 +1638,10 @@ mod tests {
         );
         // Never asked at the height's low 32 bits.
         assert!(headers.asked.lock().unwrap().is_empty());
-        // The same bytes at a height a header service has are verified.
+        // The same layout at a height a header service has is verified. The
+        // height's varint is bsv-rs's canonical one since 0.5.0 (five bytes
+        // here); the hand-written nine-byte form it replaced was not canonical
+        // below `u32::MAX`.
         let root = tx.id();
         let headers = StubHeaders::answering(HEIGHT, Ok(root));
         assert_eq!(

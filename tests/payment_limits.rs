@@ -12,7 +12,7 @@ use bsv_middleware_rs::{
     verify_payment, verify_payment_output_only, HeaderLookupError, HeaderService, Kind,
     PaymentToVerify, PaymentVerdict, Reason, UnverifiableReason,
 };
-use bsv_rs::primitives::sha256d;
+use bsv_rs::primitives::{sha256d, to_var_int};
 use bsv_rs::transaction::{Beef, MerklePath};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -96,15 +96,6 @@ fn refusal(verdict: PaymentVerdict, what: &str) -> String {
     }
 }
 
-fn varint(n: u64) -> Vec<u8> {
-    match n {
-        0..=0xFC => vec![n as u8],
-        0xFD..=0xFFFF => [&[0xFD][..], &(n as u16).to_le_bytes()].concat(),
-        0x1_0000..=0xFFFF_FFFF => [&[0xFE][..], &(n as u32).to_le_bytes()].concat(),
-        _ => [&[0xFF][..], &n.to_le_bytes()].concat(),
-    }
-}
-
 /// A raw transaction with one input per source, each spending output 0 with
 /// an empty unlock, paying `PRICE` to `OP_TRUE` at output 0 and, when
 /// `padding` is not 0, a second output of no satoshis whose script is
@@ -112,7 +103,7 @@ fn varint(n: u64) -> Vec<u8> {
 /// broadcast.
 fn raw_tx(sources: &[[u8; 32]], nonce: u32, padding: usize) -> Vec<u8> {
     let mut v = 1u32.to_le_bytes().to_vec();
-    v.extend(varint(sources.len() as u64));
+    v.extend(to_var_int(sources.len() as u64));
     for source in sources {
         v.extend_from_slice(source);
         v.extend_from_slice(&0u32.to_le_bytes());
@@ -121,11 +112,11 @@ fn raw_tx(sources: &[[u8; 32]], nonce: u32, padding: usize) -> Vec<u8> {
     }
     v.push(if padding == 0 { 1 } else { 2 });
     v.extend_from_slice(&PRICE.to_le_bytes());
-    v.extend(varint(SCRIPT.len() as u64));
+    v.extend(to_var_int(SCRIPT.len() as u64));
     v.extend_from_slice(SCRIPT);
     if padding != 0 {
         v.extend_from_slice(&0u64.to_le_bytes());
-        v.extend(varint(padding as u64 + 7));
+        v.extend(to_var_int(padding as u64 + 7));
         v.extend_from_slice(&[0x00, 0x6a, 0x4e]);
         v.extend_from_slice(&(padding as u32).to_le_bytes());
         v.resize(v.len() + padding, 0xAB);

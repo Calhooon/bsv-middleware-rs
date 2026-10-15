@@ -2,6 +2,9 @@
 //!
 //! This module provides the wire format for BSV authentication headers
 //! and the varint-based payload serialization used for message signing.
+//! Every varint is bsv-rs's canonical one (`bsv_rs::primitives::to_var_int`).
+
+use bsv_rs::primitives::to_var_int;
 
 /// BRC-104 authentication header names.
 pub mod auth_headers {
@@ -81,24 +84,24 @@ impl HttpResponseData {
         payload.extend_from_slice(&self.request_id);
 
         // Status code as varint
-        payload.extend_from_slice(&write_varint(self.status as i64));
+        payload.extend_from_slice(&to_var_int(self.status as u64));
 
         // Number of headers as varint
         let signable = filter_signable_headers(&self.headers);
-        payload.extend_from_slice(&write_varint(signable.len() as i64));
+        payload.extend_from_slice(&to_var_int(signable.len() as u64));
 
         // Each header: key_len + key + value_len + value
         for (key, value) in &signable {
             let key_bytes = key.as_bytes();
             let value_bytes = value.as_bytes();
-            payload.extend_from_slice(&write_varint(key_bytes.len() as i64));
+            payload.extend_from_slice(&to_var_int(key_bytes.len() as u64));
             payload.extend_from_slice(key_bytes);
-            payload.extend_from_slice(&write_varint(value_bytes.len() as i64));
+            payload.extend_from_slice(&to_var_int(value_bytes.len() as u64));
             payload.extend_from_slice(value_bytes);
         }
 
         // Body length as varint + body bytes
-        payload.extend_from_slice(&write_varint(self.body.len() as i64));
+        payload.extend_from_slice(&to_var_int(self.body.len() as u64));
         payload.extend_from_slice(&self.body);
 
         payload
@@ -127,33 +130,33 @@ pub fn build_request_payload(
 
     // Method
     let method_bytes = method.as_bytes();
-    payload.extend_from_slice(&write_varint(method_bytes.len() as i64));
+    payload.extend_from_slice(&to_var_int(method_bytes.len() as u64));
     payload.extend_from_slice(method_bytes);
 
     // Path
     let path_bytes = path.as_bytes();
-    payload.extend_from_slice(&write_varint(path_bytes.len() as i64));
+    payload.extend_from_slice(&to_var_int(path_bytes.len() as u64));
     payload.extend_from_slice(path_bytes);
 
     // Search/query
     let search_bytes = search.as_bytes();
-    payload.extend_from_slice(&write_varint(search_bytes.len() as i64));
+    payload.extend_from_slice(&to_var_int(search_bytes.len() as u64));
     payload.extend_from_slice(search_bytes);
 
     // Headers (only signable ones)
     let signable = filter_signable_headers(headers);
-    payload.extend_from_slice(&write_varint(signable.len() as i64));
+    payload.extend_from_slice(&to_var_int(signable.len() as u64));
     for (key, value) in &signable {
         let key_bytes = key.as_bytes();
         let value_bytes = value.as_bytes();
-        payload.extend_from_slice(&write_varint(key_bytes.len() as i64));
+        payload.extend_from_slice(&to_var_int(key_bytes.len() as u64));
         payload.extend_from_slice(key_bytes);
-        payload.extend_from_slice(&write_varint(value_bytes.len() as i64));
+        payload.extend_from_slice(&to_var_int(value_bytes.len() as u64));
         payload.extend_from_slice(value_bytes);
     }
 
     // Body
-    payload.extend_from_slice(&write_varint(body.len() as i64));
+    payload.extend_from_slice(&to_var_int(body.len() as u64));
     payload.extend_from_slice(body);
 
     payload
@@ -182,52 +185,35 @@ pub fn filter_signable_headers(headers: &[(String, String)]) -> Vec<(String, Str
     result
 }
 
-/// Encodes an integer as a Bitcoin-style varint.
-///
-/// This matches the BRC-104 binary serialization format used by all BSV SDKs.
-pub fn write_varint(value: i64) -> Vec<u8> {
-    if value < 0 {
-        return vec![0];
-    }
-    let v = value as u64;
-    if v < 253 {
-        vec![v as u8]
-    } else if v <= 0xFFFF {
-        let mut buf = vec![253u8];
-        buf.extend_from_slice(&(v as u16).to_le_bytes());
-        buf
-    } else if v <= 0xFFFF_FFFF {
-        let mut buf = vec![254u8];
-        buf.extend_from_slice(&(v as u32).to_le_bytes());
-        buf
-    } else {
-        let mut buf = vec![255u8];
-        buf.extend_from_slice(&v.to_le_bytes());
-        buf
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // The three tests below ran the transport's own `write_varint`, deleted
+    // in 0.5.0 for bsv-rs's `to_var_int`; they now hold the bytes the payload
+    // writes through bsv-rs to the same values.
     #[test]
     fn test_write_varint_small() {
-        assert_eq!(write_varint(0), vec![0]);
-        assert_eq!(write_varint(1), vec![1]);
-        assert_eq!(write_varint(252), vec![252]);
+        assert_eq!(to_var_int(0), vec![0]);
+        assert_eq!(to_var_int(1), vec![1]);
+        assert_eq!(to_var_int(252), vec![252]);
     }
 
     #[test]
     fn test_write_varint_medium() {
-        let result = write_varint(253);
+        let result = to_var_int(253);
         assert_eq!(result[0], 253);
         assert_eq!(result.len(), 3);
     }
 
+    // `write_varint(-1)` wrote `[0]`; no payload field can be negative (each
+    // is a `u16` status or a length), so bsv-rs's `u64` makes the case
+    // unwritable. The test now holds what the old one guarded: an empty body
+    // is written as the one byte 0.
     #[test]
     fn test_write_varint_negative() {
-        assert_eq!(write_varint(-1), vec![0]);
+        let payload = build_request_payload(&[0u8; 32], "", "", "", &[], &[]);
+        assert_eq!(payload, [&[0u8][..], &[0u8; 32], &[0, 0, 0, 0, 0]].concat());
     }
 
     #[test]
