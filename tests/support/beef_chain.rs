@@ -4,35 +4,18 @@
 //!
 //! Copied from `bsv-rs@b69b984 tests/support/beef_chain.rs` (v0.4.0, the
 //! NL-3 lane's builder; bsv-stack-lean #57), less the resumption helper.
+//! Its varint is bsv-rs's `to_var_int` (0.5.0; the copy's own was deleted).
 #![allow(dead_code)]
 
 use std::io::Read;
 
-use bsv_rs::primitives::sha256d;
+use bsv_rs::primitives::{sha256d, to_var_int};
 
 pub type Hash32 = [u8; 32];
 
 pub const SATS: u64 = 1_000;
 pub const HEIGHT: u64 = 800_000;
 pub const OP_TRUE: u8 = 0x51;
-
-pub fn varint(n: u64) -> Vec<u8> {
-    if n < 0xFD {
-        vec![n as u8]
-    } else if n < 0x1_0000 {
-        let mut v = vec![0xFD];
-        v.extend_from_slice(&(n as u16).to_le_bytes());
-        v
-    } else if n < 0x1_0000_0000 {
-        let mut v = vec![0xFE];
-        v.extend_from_slice(&(n as u32).to_le_bytes());
-        v
-    } else {
-        let mut v = vec![0xFF];
-        v.extend_from_slice(&n.to_le_bytes());
-        v
-    }
-}
 
 /// A transaction spending `prev:0` with an empty unlock, paying `outputs`
 /// `OP_TRUE` outputs of `SATS` each (the P0-5 `spend`).
@@ -43,7 +26,7 @@ pub fn spend(prev: &Hash32, outputs: usize) -> Vec<u8> {
     v.extend_from_slice(&0u32.to_le_bytes());
     v.push(0);
     v.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
-    v.extend(varint(outputs as u64));
+    v.extend(to_var_int(outputs as u64));
     for _ in 0..outputs {
         v.extend_from_slice(&SATS.to_le_bytes());
         v.push(1);
@@ -100,10 +83,10 @@ impl ChainSource {
         // leaf at offset 0 flagged as a txid), the transaction count.
         let mut piece = 0xEFBE_0002u32.to_le_bytes().to_vec();
         piece.push(1);
-        piece.extend(varint(HEIGHT));
+        piece.extend(to_var_int(HEIGHT));
         piece.extend_from_slice(&[1, 1, 0, 2]);
         piece.extend_from_slice(&funding_root());
-        piece.extend(varint(n as u64));
+        piece.extend(to_var_int(n as u64));
         Self {
             n,
             output_padding,
@@ -134,7 +117,7 @@ impl ChainSource {
                 // locking script drops its padding before yielding true.
                 let script = padded_lock(self.output_padding);
                 let mut padded = raw[..55].to_vec();
-                padded.extend(varint(script.len() as u64));
+                padded.extend(to_var_int(script.len() as u64));
                 padded.extend_from_slice(&script);
                 padded.extend_from_slice(&raw[57..]);
                 raw = padded;
