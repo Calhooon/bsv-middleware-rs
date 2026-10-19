@@ -6,7 +6,7 @@ the crate supplies protocol verification.
 
 The release of record is the tag **v0.5.0**, published on crates.io as
 **0.5.0** (the same version; `Cargo.toml` says 0.5.0). It depends on
-**bsv-rs 0.6.0** by caret, and the re-exported bsv-rs types come from that
+**bsv-rs 0.7.0** by caret, and the re-exported bsv-rs types come from that
 line, so a consumer moves bsv-rs and this crate together.
 [CHANGELOG.md](CHANGELOG.md) records each release; the repository's Releases
 page carries one Release per tag.
