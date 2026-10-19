@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0] - 2026-10-18
+
+- bsv-rs 0.7.0, declared by caret (`bsv-rs = "0.7.0"`). Its default signing digest is the node's: the dispatch (BIP143 for a type with `SIGHASH_FORKID` and without `SIGHASH_CHRONICLE`, the original digest otherwise), the `SIGHASH_SINGLE` sentinel, and an explicit scriptCode. The crate compiled and every test passed unchanged; no source change was needed.
+- The payment door's spends are judged by bsv-rs's interpreter, so the digest it verifies against is that dispatch. `the_door_verifies_against_the_sdks_dispatched_signing_digest` pins it: a P2PKH spend signed through `SigningContext` verifies under `ALL|FORKID` and `ALL|FORKID|CHRONICLE`, and a `ALL|FORKID|CHRONICLE` signature over the BIP143 digest (what bsv-rs 0.6.1's context signed) is refused as `SpendRefused { why: Script(_) }`.
+- The 22 BRC-29 conformance vectors pass unchanged; no verdict moved.
+- Breaking: the re-exported bsv-rs types (`Kind`, `Reason`, `AsyncByteSource`, `MiningCheck`, `SpendRefusal`) and `From<bsv_rs::Error>` now come from bsv-rs 0.7.0, a new compatibility line under cargo; a consumer moves bsv-rs and this crate together.
+
 ## [0.5.0] - 2026-10-15
 
 - bsv-rs 0.6.0, declared by caret (`bsv-rs = "0.6.0"`), is the home of the varint: every BRC-104 payload length and status is written by `bsv_rs::primitives::to_var_int`. The payload bytes are unchanged for every value the transport writes.

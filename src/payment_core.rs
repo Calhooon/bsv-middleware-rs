@@ -888,8 +888,12 @@ fn header_service_host(base: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bsv_rs::primitives::bsv::sighash::{
+        compute_sighash_for_signing, parse_transaction, SighashParams, SIGHASH_ALL, SIGHASH_FORKID,
+    };
+    use bsv_rs::primitives::bsv::TransactionSignature;
     use bsv_rs::primitives::PrivateKey;
-    use bsv_rs::script::LockingScript;
+    use bsv_rs::script::{LockingScript, Script, SigningContext, UnlockingScript};
     use bsv_rs::transaction::{
         Beef, MerklePath, MerklePathLeaf, TransactionInput, TransactionOutput,
     };
@@ -1439,6 +1443,100 @@ mod tests {
         assert_eq!(
             verify_payment_output_only(&payment(0, OP_TRUE), &beef[..]).unwrap(),
             PaymentVerdict::Verified { satoshis: PRICE }
+        );
+    }
+
+    /// `parent:0` (a P2PKH of `key`) spent with a signature of hash type
+    /// `scope` over `digest(raw, scope)`; the subject pays `OP_TRUE`.
+    fn signed_spend(
+        parent: &Transaction,
+        key: &PrivateKey,
+        scope: u32,
+        digest: impl Fn(&[u8], &Script) -> [u8; 32],
+    ) -> Transaction {
+        let mut subject = spending(parent, &[(PRICE, OP_TRUE.to_vec())]);
+        let lock = parent.outputs[0].locking_script.as_script();
+        let sighash = digest(&subject.to_binary(), lock);
+        let sig = TransactionSignature::new(key.sign(&sighash).unwrap(), scope);
+        let mut unlock = Script::new();
+        unlock
+            .write_bin(&sig.to_checksig_format())
+            .write_bin(&key.public_key().to_compressed());
+        subject.inputs[0].unlocking_script = Some(UnlockingScript::from_script(unlock));
+        subject.invalidate_caches();
+        subject
+    }
+
+    /// The digest the door verifies a spend against is bsv-rs 0.7.0's
+    /// signing digest, the node's dispatch: BIP143 for a FORKID type without
+    /// CHRONICLE, the original digest for FORKID|CHRONICLE. A signature over
+    /// the BIP143 digest under FORKID|CHRONICLE (what `SigningContext` signed
+    /// in bsv-rs 0.6.1) is refused.
+    #[tokio::test]
+    async fn the_door_verifies_against_the_sdks_dispatched_signing_digest() {
+        const FORKID: u32 = SIGHASH_ALL | SIGHASH_FORKID;
+        const CHRONICLE: u32 = FORKID | 0x20;
+        let key = PrivateKey::from_hex(SENDER_KEY).unwrap();
+        let parent = spending(
+            &coinbase(&[(1, vec![0x52])]),
+            &[(PRICE, p2pkh(&key.public_key().hash160()))],
+        );
+        let context = |scope: u32| {
+            move |raw: &[u8], lock: &Script| {
+                SigningContext::new(raw, 0, PRICE, lock)
+                    .compute_sighash(scope)
+                    .unwrap()
+            }
+        };
+        let bip143 = |scope: u32| {
+            move |raw: &[u8], lock: &Script| {
+                let tx = parse_transaction(raw).unwrap();
+                compute_sighash_for_signing(&SighashParams {
+                    version: tx.version,
+                    inputs: &tx.inputs,
+                    outputs: &tx.outputs,
+                    locktime: tx.locktime,
+                    input_index: 0,
+                    subscript: &lock.to_binary(),
+                    satoshis: PRICE,
+                    scope,
+                })
+            }
+        };
+        let door = |subject: &Transaction| {
+            let (beef, root) = beef_of(&[&parent, subject], true);
+            async move {
+                let headers = StubHeaders::answering(HEIGHT, Ok(root));
+                full(&beef, OP_TRUE, &headers).await
+            }
+        };
+        for scope in [FORKID, CHRONICLE] {
+            let subject = signed_spend(&parent, &key, scope, context(scope));
+            assert_eq!(
+                door(&subject).await,
+                PaymentVerdict::Verified { satoshis: PRICE },
+                "{scope:#x}"
+            );
+        }
+        // Under FORKID alone the two digests are one; under CHRONICLE they part.
+        let raw = signed_spend(&parent, &key, FORKID, context(FORKID)).to_binary();
+        let lock = parent.outputs[0].locking_script.as_script();
+        assert_eq!(context(FORKID)(&raw, lock), bip143(FORKID)(&raw, lock));
+        assert_ne!(
+            context(CHRONICLE)(&raw, lock),
+            bip143(CHRONICLE)(&raw, lock)
+        );
+        let stale = signed_spend(&parent, &key, CHRONICLE, bip143(CHRONICLE));
+        assert!(
+            matches!(
+                door(&stale).await,
+                PaymentVerdict::Unverifiable(UnverifiableReason::SpendRefused {
+                    input: Some(0),
+                    why: SpendRefusal::Script(_),
+                    ..
+                })
+            ),
+            "a CHRONICLE signature over the BIP143 digest is refused"
         );
     }
 
