@@ -4,7 +4,7 @@
 #![cfg(feature = "axum")]
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use async_trait::async_trait;
 use axum::body::Body;
@@ -14,13 +14,13 @@ use axum::routing::post;
 use axum::Router;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use bsv_middleware_rs::axum_layer::{
-    require_payment, PaymentGate, VerifiedPayment, PAYMENT_TRANSPORTS,
+    require_payment, MemoryPaymentStorage, PaymentGate, VerifiedPayment, PAYMENT_TRANSPORTS,
 };
 use bsv_middleware_rs::payment::{
     create_derivation_prefix, payment_headers, verify_derivation_prefix,
 };
 use bsv_middleware_rs::payment_core::BRC29_PROTOCOL_NAME;
-use bsv_middleware_rs::{AuthContext, HeaderLookupError, HeaderService};
+use bsv_middleware_rs::{AuthContext, HeaderLookupError, HeaderService, PaymentStorage};
 use bsv_rs::primitives::{sha256d, to_var_int, PrivateKey, PublicKey};
 use bsv_rs::script::LockingScript;
 use bsv_rs::transaction::{
@@ -73,9 +73,15 @@ fn payer_script(payer: &str, prefix: &str) -> Vec<u8> {
 /// A BEEF of one payment proven by a one-leaf BUMP at `HEIGHT`; the root is
 /// the txid.
 fn proven_beef(satoshis: u64, script: &[u8]) -> (Vec<u8>, String) {
+    proven_beef_at(HEIGHT, satoshis, script)
+}
+
+/// [`proven_beef`] proven at `height`, which it also spends from, so two
+/// heights make two transactions.
+fn proven_beef_at(height: u32, satoshis: u64, script: &[u8]) -> (Vec<u8>, String) {
     let mut tx = Transaction::new();
     tx.add_input(TransactionInput {
-        source_txid: Some("11".repeat(32)),
+        source_txid: Some(format!("{:064x}", height)),
         source_output_index: 0,
         ..Default::default()
     })
@@ -87,7 +93,7 @@ fn proven_beef(satoshis: u64, script: &[u8]) -> (Vec<u8>, String) {
     .unwrap();
     let txid = tx.id();
     let bump = MerklePath::new(
-        HEIGHT,
+        height,
         vec![vec![MerklePathLeaf::new_txid(0, txid.clone())]],
     )
     .unwrap();
@@ -117,8 +123,16 @@ struct App {
     served: Arc<AtomicUsize>,
 }
 
+/// The prefix store every gate here shares, so a prefix issued by
+/// [`prefix`] is one the gate recorded.
+static PREFIXES: LazyLock<Arc<MemoryPaymentStorage>> = LazyLock::new(Default::default);
+
+fn gate(server: ProtoWallet, price: u64, headers: Option<Arc<dyn HeaderService>>) -> PaymentGate {
+    PaymentGate::new(server, price, headers).with_prefix_store(PREFIXES.clone(), 3600)
+}
+
 fn app(headers: Option<Arc<dyn HeaderService>>) -> App {
-    let gate = Arc::new(PaymentGate::new(wallet(SERVER_KEY), PRICE, headers));
+    let gate = Arc::new(gate(wallet(SERVER_KEY), PRICE, headers));
     let served = Arc::new(AtomicUsize::new(0));
     let count = served.clone();
     let router = Router::new()
@@ -146,8 +160,14 @@ fn headers_answering_root(root: &str) -> Option<Arc<dyn HeaderService>> {
     )))
 }
 
+/// A prefix as a 402 issues it: made by the server's key and recorded.
 fn prefix() -> String {
-    create_derivation_prefix(&wallet(SERVER_KEY)).unwrap()
+    issued(create_derivation_prefix(&wallet(SERVER_KEY)).unwrap())
+}
+
+fn issued(prefix: String) -> String {
+    futures::executor::block_on(PREFIXES.store_derivation_prefix(&prefix, 3600)).unwrap();
+    prefix
 }
 
 fn payment_header(prefix: &str, tx: &[u8]) -> String {
@@ -238,6 +258,89 @@ async fn exact_and_over_are_served_with_the_amount_read() {
         );
         assert_eq!(app.served.load(Ordering::SeqCst), 1);
     }
+}
+
+/// Answers each root it holds at the height its proof names.
+struct Roots(Vec<(u32, String)>);
+
+#[async_trait]
+impl HeaderService for Roots {
+    async fn merkle_root_at(&self, height: u32) -> Result<String, HeaderLookupError> {
+        self.0
+            .iter()
+            .find(|(h, _)| *h == height)
+            .map(|(_, root)| root.clone())
+            .ok_or_else(|| HeaderLookupError("not indexed".into()))
+    }
+}
+
+/// M14, the witness `paid-request-prefix-reused-with-a-new-transaction`:
+/// one prefix, two transactions. The first is served; the second, and the
+/// first again, are refused 402 with a fresh challenge, and the handler (the
+/// wallet's caller) runs once.
+#[tokio::test]
+async fn a_prefix_paid_with_a_second_transaction_is_refused_and_the_wallet_called_once() {
+    let prefix = prefix();
+    let script = payer_script(SENDER_KEY, &prefix);
+    let (t1, root1) = proven_beef_at(HEIGHT, PRICE, &script);
+    let (t2, root2) = proven_beef_at(HEIGHT + 1, PRICE, &script);
+    assert_ne!(root1, root2, "two transactions");
+    let headers: Arc<dyn HeaderService> =
+        Arc::new(Roots(vec![(HEIGHT, root1), (HEIGHT + 1, root2)]));
+    let app = app(Some(headers));
+    let sender = identity(SENDER_KEY);
+    let (status, _, body) = send(&app, Some(&sender), Some(payment_header(&prefix, &t1))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["prefix"], prefix);
+    for tx in [&t2, &t1] {
+        let (status, response, body) =
+            send(&app, Some(&sender), Some(payment_header(&prefix, tx))).await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{body}");
+        assert_eq!(body["code"], "ERR_INVALID_DERIVATION_PREFIX");
+        assert_eq!(body["satoshisRequired"], PRICE);
+        assert_fresh_challenge(&response, Some(&prefix));
+    }
+    assert_eq!(app.served.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_prefix_the_gate_never_issued_or_past_its_window_is_refused() {
+    let sender = identity(SENDER_KEY);
+    // HMAC-valid but never recorded: another instance's, or forged by a key holder.
+    let unrecorded = create_derivation_prefix(&wallet(SERVER_KEY)).unwrap();
+    let (beef, root) = proven_beef(PRICE, &payer_script(SENDER_KEY, &unrecorded));
+    let app = app(headers_answering_root(&root));
+    let (status, _, body) = send(
+        &app,
+        Some(&sender),
+        Some(payment_header(&unrecorded, &beef)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{body}");
+    assert_eq!(body["code"], "ERR_INVALID_DERIVATION_PREFIX");
+    // A window of zero seconds: recorded, and expired by the time it is paid.
+    let store = Arc::new(MemoryPaymentStorage::default());
+    let gate = Arc::new(
+        PaymentGate::new(wallet(SERVER_KEY), PRICE, headers_answering_root(&root))
+            .with_prefix_store(store.clone(), 0),
+    );
+    store.store_derivation_prefix(&unrecorded, 0).await.unwrap();
+    let router = Router::new()
+        .route("/paid", post(|_: VerifiedPayment| async { "served" }))
+        .layer(axum::middleware::from_fn_with_state(gate, require_payment));
+    let expired = App {
+        router,
+        served: Arc::new(AtomicUsize::new(0)),
+    };
+    let (status, _, body) = send(
+        &expired,
+        Some(&sender),
+        Some(payment_header(&unrecorded, &beef)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{body}");
+    assert_eq!(body["code"], "ERR_INVALID_DERIVATION_PREFIX");
+    assert_eq!(app.served.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -492,6 +595,8 @@ async fn a_payment_in_the_body_is_streamed_verified_and_served() {
     let prefix = prefix();
     let (beef, root) = chain_beef(298, PRICE, &payer_script(SENDER_KEY, &prefix), 0);
     for chunk in [1, 7, 4096, beef.len()] {
+        // A fresh server per reading, which issued this prefix.
+        issued(prefix.clone());
         let app = app(headers_answering_root(&root));
         let (status, response, body) = send_with_body(
             &app,
@@ -688,7 +793,7 @@ async fn all_22_vector_cases_reach_the_axum_door() {
     for case in cases {
         let name = case["name"].as_str().unwrap();
         let server = wallet(case["server_private_key"].as_str().unwrap());
-        let prefix = create_derivation_prefix(&server).unwrap();
+        let prefix = issued(create_derivation_prefix(&server).unwrap());
         let sender = case["sender_identity_key"].as_str().unwrap();
         let suffix = case["derivation_suffix"].as_str().unwrap();
         let script =
@@ -737,7 +842,7 @@ async fn all_22_vector_cases_reach_the_axum_door() {
             };
             Some(Arc::new(StubHeaders(answer, Mutex::new(Vec::new()))) as Arc<dyn HeaderService>)
         };
-        let gate = Arc::new(PaymentGate::new(
+        let gate = Arc::new(gate(
             server,
             case["required_satoshis"].as_u64().unwrap(),
             headers,

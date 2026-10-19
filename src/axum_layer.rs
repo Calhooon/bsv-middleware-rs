@@ -23,9 +23,23 @@
 //! wrong key or too little is answered 402 with a fresh challenge, so the
 //! client can pay again.
 //!
-//! The gate does not internalize the payment or claim it against replay: the
-//! handler receives [`VerifiedPayment`] (the transaction, the remittance and
-//! the amount read) and internalizes it with its wallet.
+//! The gate does not internalize the payment: the handler receives
+//! [`VerifiedPayment`] (the transaction, the remittance and the amount read)
+//! and internalizes it with its wallet.
+//!
+//! # One payment per derivation prefix
+//!
+//! BRC-105: "each `derivationPrefix` can only be used once" (`[SRC]
+//! BRCs@ed1b015 payments/0105.md:254-255`). The gate records every prefix it
+//! issues in its [`PaymentStorage`] for the store's TTL (the prefix's window)
+//! and consumes it when a payment under it is verified, before the handler
+//! runs. A second payment under the same prefix, whatever its transaction,
+//! is refused 402 `ERR_INVALID_DERIVATION_PREFIX` with a fresh challenge and
+//! never reaches the handler or its wallet; so is a prefix past its window or
+//! one the store never recorded. Here the gate departs from the reference,
+//! which checks the prefix by its HMAC alone and keys replay on the txid
+//! (`index.ts:297-316`, `:351-376`), so it takes a reused prefix with a new
+//! transaction as a new payment.
 //!
 //! # A payment of any size: the body transport
 //!
@@ -47,9 +61,12 @@
 //! hands them to the handler to internalize; the handler's request body is
 //! empty, the body having been the payment.
 
+use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use axum::body::{Body, HttpBody};
 use axum::extract::{FromRequestParts, Request, State};
 use axum::http::request::Parts;
@@ -63,14 +80,16 @@ use bsv_rs::wallet::ProtoWallet;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::error::Result as StoreResult;
 use crate::payment::{
     build_402_headers, create_derivation_prefix, payment_headers, verify_derivation_prefix,
+    PaymentStorage,
 };
 use crate::payment_core::{
     brc29_locking_script, verify_payment, verify_payment_async, AsyncByteSource, HeaderService,
     PaymentToVerify, PaymentVerdict,
 };
-use crate::types::AuthContext;
+use crate::types::{AuthContext, StoredPayment};
 
 /// The output a payment is internalized at: the reference internalizes
 /// output 0 (`index.ts:339`).
@@ -79,6 +98,10 @@ pub const PAYMENT_OUTPUT_INDEX: u32 = 0;
 /// The transports the challenge names: the reference's header, and the
 /// request body for a payment a header cannot carry.
 pub const PAYMENT_TRANSPORTS: &str = "header,body";
+
+/// How long an issued derivation prefix can be paid under when the gate keeps
+/// its own store: one hour. `[D]` the reference's prefix has no window.
+pub const DEFAULT_PREFIX_TTL_SECONDS: u64 = 3600;
 
 /// The `x-bsv-payment` header: the remittance, and the transaction when it
 /// travels in the header. Without one, the request body is the transaction.
@@ -124,10 +147,15 @@ pub struct PaymentGate {
     wallet: ProtoWallet,
     satoshis_required: u64,
     header_service: Option<Arc<dyn HeaderService>>,
+    prefixes: Arc<dyn PaymentStorage>,
+    prefix_ttl_seconds: u64,
 }
 
 impl PaymentGate {
-    /// A gate charging `satoshis_required` (0 serves without a payment).
+    /// A gate charging `satoshis_required` (0 serves without a payment). Its
+    /// issued prefixes are kept in this process's memory for
+    /// [`DEFAULT_PREFIX_TTL_SECONDS`]; a server of several instances shares
+    /// one store with [`PaymentGate::with_prefix_store`].
     pub fn new(
         wallet: ProtoWallet,
         satoshis_required: u64,
@@ -137,7 +165,74 @@ impl PaymentGate {
             wallet,
             satoshis_required,
             header_service,
+            prefixes: Arc::new(MemoryPaymentStorage::default()),
+            prefix_ttl_seconds: DEFAULT_PREFIX_TTL_SECONDS,
         }
+    }
+
+    /// The store that records issued prefixes and consumes each once, and
+    /// the window (`ttl_seconds`) an issued prefix can be paid under.
+    pub fn with_prefix_store(mut self, store: Arc<dyn PaymentStorage>, ttl_seconds: u64) -> Self {
+        self.prefixes = store;
+        self.prefix_ttl_seconds = ttl_seconds;
+        self
+    }
+}
+
+/// A [`PaymentStorage`] in this process's memory, the gate's default store.
+/// Expired prefixes are dropped as new ones are stored.
+#[derive(Default)]
+pub struct MemoryPaymentStorage {
+    prefixes: Mutex<HashMap<String, Instant>>,
+    payments: Mutex<HashMap<(String, u32), StoredPayment>>,
+}
+
+#[async_trait]
+impl PaymentStorage for MemoryPaymentStorage {
+    async fn get_payment(&self, txid: &str, vout: u32) -> StoreResult<Option<StoredPayment>> {
+        let payments = self.payments.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(payments.get(&(txid.to_string(), vout)).cloned())
+    }
+
+    async fn payment_exists(&self, txid: &str, vout: u32) -> StoreResult<bool> {
+        let payments = self.payments.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(payments.contains_key(&(txid.to_string(), vout)))
+    }
+
+    async fn store_payment(&self, payment: &StoredPayment) -> StoreResult<()> {
+        let mut payments = self.payments.lock().unwrap_or_else(|e| e.into_inner());
+        payments.insert((payment.txid.clone(), payment.vout), payment.clone());
+        Ok(())
+    }
+
+    async fn mark_spent(&self, txid: &str, vout: u32) -> StoreResult<()> {
+        let mut payments = self.payments.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(payment) = payments.get_mut(&(txid.to_string(), vout)) {
+            payment.spent = true;
+        }
+        Ok(())
+    }
+
+    async fn store_derivation_prefix(
+        &self,
+        derivation_prefix: &str,
+        ttl_seconds: u64,
+    ) -> StoreResult<()> {
+        let now = Instant::now();
+        let mut prefixes = self.prefixes.lock().unwrap_or_else(|e| e.into_inner());
+        prefixes.retain(|_, expires| *expires > now);
+        let expires = now
+            .checked_add(Duration::from_secs(ttl_seconds))
+            .unwrap_or(now);
+        prefixes.insert(derivation_prefix.to_string(), expires);
+        Ok(())
+    }
+
+    async fn consume_derivation_prefix(&self, derivation_prefix: &str) -> StoreResult<bool> {
+        let mut prefixes = self.prefixes.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(prefixes
+            .remove(derivation_prefix)
+            .is_some_and(|expires| expires > Instant::now()))
     }
 }
 
@@ -186,7 +281,8 @@ pub async fn require_payment(
             &gate,
             "ERR_PAYMENT_REQUIRED",
             "A BSV payment is required. Provide the X-BSV-Payment header.",
-        );
+        )
+        .await;
     };
     let Some(payment) = header
         .to_str()
@@ -265,7 +361,7 @@ pub async fn require_payment(
     let satoshis_paid = match verdict {
         PaymentVerdict::Verified { satoshis } => satoshis,
         PaymentVerdict::Underpaid { .. } | PaymentVerdict::WrongScript { .. } => {
-            return challenge(&gate, "ERR_INVALID_PAYMENT", &description)
+            return challenge(&gate, "ERR_INVALID_PAYMENT", &description).await
         }
         PaymentVerdict::NoHeaderService => {
             return error(
@@ -288,6 +384,30 @@ pub async fn require_payment(
             return error(StatusCode::BAD_REQUEST, "ERR_INVALID_PAYMENT", &description)
         }
     };
+    // BRC-105: the prefix pays once. Claimed before the handler, so a second
+    // payment under it never reaches the wallet.
+    match gate
+        .prefixes
+        .consume_derivation_prefix(&payment.derivation_prefix)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            return challenge(
+                &gate,
+                "ERR_INVALID_DERIVATION_PREFIX",
+                "The payment derivation prefix was already used or has expired.",
+            )
+            .await
+        }
+        Err(_) => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ERR_PAYMENT_UNAVAILABLE",
+                "Payment processing is temporarily unavailable.",
+            )
+        }
+    }
     request.extensions_mut().insert(VerifiedPayment {
         satoshis_paid,
         transaction,
@@ -304,10 +424,22 @@ pub async fn require_payment(
     response
 }
 
-/// 402 with a fresh derivation prefix (`index.ts:183-208`); 503 if none can
-/// be made.
-fn challenge(gate: &PaymentGate, code: &str, description: &str) -> Response {
+/// 402 with a fresh derivation prefix (`index.ts:183-208`), recorded in the
+/// gate's store for its window; 503 if none can be made or recorded.
+async fn challenge(gate: &PaymentGate, code: &str, description: &str) -> Response {
     let Ok(prefix) = create_derivation_prefix(&gate.wallet) else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ERR_PAYMENT_UNAVAILABLE",
+            "Payment processing is temporarily unavailable.",
+        );
+    };
+    if gate
+        .prefixes
+        .store_derivation_prefix(&prefix, gate.prefix_ttl_seconds)
+        .await
+        .is_err()
+    {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
             "ERR_PAYMENT_UNAVAILABLE",
