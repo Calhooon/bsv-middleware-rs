@@ -59,9 +59,17 @@ request body, which it streams through `verify_payment_async`; the 402
 challenge names both transports (`x-bsv-payment-transports: header,body`).
 Underpaid and wrong-script payments get a 402 with a fresh challenge, a
 server-side `Unverifiable` gets 503, `NoHeaderService` gets 500, and other
-refusals get 400. The gate does not internalize the payment or guard it
-against replay: the handler receives `VerifiedPayment` and internalizes it
-with its wallet.
+refusals get 400. The gate does not internalize the payment: the handler
+receives `VerifiedPayment` and internalizes it with its wallet.
+
+BRC-105 says each `derivationPrefix` can only be used once, so the gate
+records every prefix it issues in a `PaymentStorage` for the store's TTL
+(`PaymentGate::with_prefix_store`; by default `MemoryPaymentStorage` and one
+hour) and consumes it when a payment under it is verified; a second payment
+under the same prefix, whatever its transaction, is refused 402
+`ERR_INVALID_DERIVATION_PREFIX` with a fresh challenge before the handler or
+its wallet is called, where the reference TypeScript middleware keys replay by
+the txid and takes it as a new payment (the divergence).
 
 [examples/axum_server.rs](examples/axum_server.rs) wires the gate behind a
 BRC-31 auth layer with in-memory sessions:

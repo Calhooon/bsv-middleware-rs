@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.6.1] - 2026-10-19
+
+- The Axum gate refuses a reused derivation prefix (BRC-105: "each `derivationPrefix` can only be used once"; rule M14 of the stack's messaging charter, the owner's ruling of 2026-10-19). Each prefix a 402 issues is recorded with `PaymentStorage::store_derivation_prefix` for the store's TTL, and `consume_derivation_prefix` claims it when a payment under it is verified, before the handler runs. A second payment under the same prefix, whatever its transaction, a prefix past its window, and an HMAC-valid prefix the store never recorded are refused 402 `ERR_INVALID_DERIVATION_PREFIX` with a fresh challenge; the handler (the wallet's caller) is not reached. A store fault is 503 `ERR_PAYMENT_UNAVAILABLE`. The reference keys replay by the txid and serves the second payment: that is the divergence, witnessed by `a_prefix_paid_with_a_second_transaction_is_refused_and_the_wallet_called_once`.
+- `PaymentGate::new` keeps its signature and keeps prefixes in `MemoryPaymentStorage` (new) for `DEFAULT_PREFIX_TTL_SECONDS` (3600); `PaymentGate::with_prefix_store(store, ttl_seconds)` supplies a shared store. A server of several instances behind one door must share one store, or a prefix issued by one instance is refused by another.
+
 ## [0.6.0] - 2026-10-18
 
 - bsv-rs 0.7.0, declared by caret (`bsv-rs = "0.7.0"`). Its default signing digest is the node's: the dispatch (BIP143 for a type with `SIGHASH_FORKID` and without `SIGHASH_CHRONICLE`, the original digest otherwise), the `SIGHASH_SINGLE` sentinel, and an explicit scriptCode. The crate compiled and every test passed unchanged; no source change was needed.
