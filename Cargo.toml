@@ -18,7 +18,7 @@ exclude = ["/.github/", "/RELEASING.md", "/CLAUDE.md"]
 # BEEF reader the payment door reads through (0.4.0: `verify_stream`), and
 # the canonical varint the BRC-104 transport writes (0.6.0: `to_var_int`), and
 # the signing digest the node dispatches, which the door verifies against (0.7.0).
-bsv-rs = { version = "0.7.0", features = ["auth", "wallet", "transaction"] }
+bsv-rs = { version = "0.8.0", features = ["auth", "wallet", "transaction"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
