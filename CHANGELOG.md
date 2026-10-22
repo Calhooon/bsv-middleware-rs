@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.6.2] - 2026-10-22
+
+- bsv-rs ^0.8 (`bsv-rs = "0.8.0"` by caret; 0.8.1 resolves): the atomic rule judged on the subject's graph (BRC-95; the owner's ruling of 2026-10-22), `Error` non_exhaustive, the typed `WalletBusy`; no source change in this crate, no wire change.
+- Breaking by the dependency: the re-exported bsv-rs types and `From<bsv_rs::Error>` now come from bsv-rs 0.8; a host matching on `bsv_rs::Error` adds a wildcard arm.
+
 ## [0.6.1] - 2026-10-19
 
 - The Axum gate refuses a reused derivation prefix (BRC-105: "each `derivationPrefix` can only be used once"; rule M14 of the stack's messaging charter, the owner's ruling of 2026-10-19). Each prefix a 402 issues is recorded with `PaymentStorage::store_derivation_prefix` for the store's TTL, and `consume_derivation_prefix` claims it when a payment under it is verified, before the handler runs. A second payment under the same prefix, whatever its transaction, a prefix past its window, and an HMAC-valid prefix the store never recorded are refused 402 `ERR_INVALID_DERIVATION_PREFIX` with a fresh challenge; the handler (the wallet's caller) is not reached. A store fault is 503 `ERR_PAYMENT_UNAVAILABLE`. The reference keys replay by the txid and serves the second payment: that is the divergence, witnessed by `a_prefix_paid_with_a_second_transaction_is_refused_and_the_wallet_called_once`.
