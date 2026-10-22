@@ -13,7 +13,7 @@ use bsv_middleware_rs::{
     PaymentToVerify, PaymentVerdict, Reason, UnverifiableReason,
 };
 use bsv_rs::primitives::{sha256d, to_var_int};
-use bsv_rs::transaction::{Beef, MerklePath};
+use bsv_rs::transaction::{Beef, MerklePath, ATOMIC_BEEF, BEEF_V2};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -351,25 +351,44 @@ async fn a_root_the_headers_do_not_carry_is_a_mismatch_at_any_size() {
 
 #[tokio::test]
 async fn the_output_check_reads_the_declared_atomic_subject() {
-    let (bytes, _) = chain_atomic(3, 0);
-    let mut beef = Beef::from_binary(&bytes).expect("honest BEEF");
+    let (honest, roots) = chain_atomic(3, 0);
+    let mut beef = Beef::from_binary(&honest).expect("honest BEEF");
     let subject = beef.atomic_txid.clone().expect("Atomic subject");
-    // A retained descendant that underpays sorts after the declared subject.
+    // A retained descendant that underpays, framed by hand after the
+    // declared subject: bsv-rs 0.8.1's `to_binary_atomic` writes the
+    // subject's closure and would drop it. The Atomic prefix, then the V2
+    // BEEF of every entry, the descendant last as a raw transaction.
     let mut wire = [0u8; 32];
     wire.copy_from_slice(&hex::decode(&subject).unwrap());
     wire.reverse();
     let mut descendant = raw_tx(&[wire], 99, 0);
     let satoshis = descendant.len() - 14;
     descendant[satoshis..satoshis + 8].copy_from_slice(&(PRICE - 1).to_le_bytes());
-    beef.merge_raw_tx(descendant, None);
-    let bytes = beef.to_binary_atomic(&subject).expect("Atomic BEEF");
+    beef.merge_raw_tx(descendant.clone(), None);
+    let mut bytes = ATOMIC_BEEF.to_le_bytes().to_vec();
+    bytes.extend_from_slice(&wire);
+    bytes.extend(beef.to_binary());
+    assert_eq!(bytes[36..40], BEEF_V2.to_le_bytes());
+    let mut tail = vec![0x00];
+    tail.extend_from_slice(&descendant);
+    assert!(bytes.ends_with(&tail), "the descendant is the last entry");
+    let at = (bytes.len() - descendant.len()) as u64;
     assert_eq!(check(&bytes), PAID);
-    // The full check holds an Atomic BEEF to the reader's rule: the subject
-    // is the tip of its ancestry. 0.2.2 read past the descendant.
-    let headers = Roots::of(&[(HEIGHT, "00".repeat(32))]);
+    // The full check holds an Atomic BEEF to BRC-95's rule on the subject's
+    // graph (the owner's rulings of 2026-10-22, bsv-stack-lean
+    // `docs/RULINGS-2026-10-12.md`): every entry is reachable from the
+    // subject through the inputs of raw entries. The descendant is not, and
+    // is refused at its offset. 0.2.2 read past it. The headers carry the
+    // BUMP's root: the refusal is the subject rule's, not the root's.
+    let headers = Roots::of(&roots);
     assert_eq!(
         full(&bytes, Some(&headers)).await,
-        invalid(4, Reason::SubjectMissing { subject: wire })
+        invalid(
+            at,
+            Reason::UnrelatedTransaction {
+                txid: txid(&descendant)
+            }
+        )
     );
     assert!(headers.asked().is_empty());
 }

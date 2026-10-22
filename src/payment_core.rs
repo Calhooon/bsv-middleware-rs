@@ -31,7 +31,9 @@
 //! 2. the source is a valid BEEF (V1, V2 or Atomic) by the streaming reader:
 //!    the frame, every BUMP's own root, every unproven transaction's inputs
 //!    naming earlier transactions and spending them (the scripts run), the
-//!    Atomic subject the tip of its ancestry; else `Unverifiable`, at the
+//!    Atomic subject a raw transaction of the BEEF and every other entry
+//!    reachable from it through the inputs of raw entries (BRC-95, bsv-rs
+//!    0.8.1; the owner's rulings of 2026-10-22); else `Unverifiable`, at the
 //!    soonest fault in stream order;
 //! 3. the subject (the Atomic BEEF's named transaction, else the last raw
 //!    transaction) has output `output_index`, else `Unverifiable`; the

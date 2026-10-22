@@ -4,6 +4,7 @@
 
 - bsv-rs ^0.8 (`bsv-rs = "0.8.0"` by caret; 0.8.1 resolves): the atomic rule judged on the subject's graph (BRC-95; the owner's ruling of 2026-10-22), `Error` non_exhaustive, the typed `WalletBusy`; no source change in this crate, no wire change.
 - Breaking by the dependency: the re-exported bsv-rs types and `From<bsv_rs::Error>` now come from bsv-rs 0.8; a host matching on `bsv_rs::Error` adds a wildcard arm.
+- `the_output_check_reads_the_declared_atomic_subject` re-read under the rule: its retained descendant is framed by hand (0.8.1's `to_binary_atomic` writes the subject's closure) and refused as `UnrelatedTransaction` at its offset, the headers carrying the BUMP's root; the module's order of checks names the graph rule (a doc sentence; no code change); the flat-memory witness's per-link ceiling 192 to 228 B, the index's input txids per link (measured 206.6 B).
 
 ## [0.6.1] - 2026-10-19
 

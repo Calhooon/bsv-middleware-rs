@@ -38,11 +38,14 @@ use support::beef_chain::{funding_root, padded_lock, ChainSource, HEIGHT, OP_TRU
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
-// bsv-rs 0.5.0 measured 17,518,420 B / 100,000 links = 175.1842 B/link
-// in this harness. 192 leaves 9.6% for runner variation while tightening the
-// existing SDK ceiling (320 B/element plus one 64 KiB chunk). It is a heap
-// regression witness, never an acceptance limit on a payment.
-const MAX_BYTES_PER_LINK: u64 = 192;
+// bsv-rs 0.8.1 measured 20,661,204 B / 100,000 links = 206.6 B/link in
+// this harness, here and on the hosted runner (0.5.0: 175.2): the index held
+// to a subject keeps every raw transaction's input txids for the atomic walk
+// (`TxEntry::prevs`, bsv-rs bf46677 `transaction/beef_stream.rs:1777`), one
+// 32-byte hash per link. 228 leaves 10.4% for runner variation, under the
+// SDK's own ceiling (400 B/element at 0.8.1, `tests/memory_profiling.rs`).
+// It is a heap regression witness, never an acceptance limit on a payment.
+const MAX_BYTES_PER_LINK: u64 = 228;
 // The existing one-element/chunk allowance: independent of the total body's
 // bytes. A 4 KiB locking script may change transient element allocations, not the index.
 const BODY_FLATNESS_BAND: u64 = 64 * 1024;
@@ -170,8 +173,9 @@ fn the_door_reads_100_000_unproven_links_with_flat_memory() {
             "{links} links: the door holds {} B over verify_stream",
             *door as i64 - *sdk as i64
         );
-        // The index is a bounded number of bytes per element (bsv-rs's own
-        // bound, tests/memory_profiling.rs: under 320 B).
+        // The index is a bounded number of bytes per element: under 320 B,
+        // bsv-rs's own bound through 0.8.0 (tests/memory_profiling.rs; 400 B
+        // at 0.8.1), so tighter than the SDK's.
         assert!(
             (*door as f64) / (*n as f64) < 320.0 + 64.0 * 1024.0 / (*n as f64),
             "{links} links: {door} B"
