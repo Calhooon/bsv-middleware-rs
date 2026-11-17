@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.6.4] - 2026-11-17
+
+- bsv-rs floor 0.8.12 (`bsv-rs = "0.8.12"` by caret, from `"0.8.11"`; the features unchanged: `auth`, `wallet`, `transaction`): a caller's lock can no longer hold this crate on a bsv-rs below 0.8.12. No source change in this crate, no wire change.
+- The advisory the floor closes: GHSA-33fm-jcm5-4m3m (0.8.12), a heap bound on BEEF linking (`BeefLinkLimits::max_link_heap_bytes`, default 56 MiB) beside the wire bound. This crate links no BEEF (`from_beef`, `find_atomic_transaction`: 0 calls); its payment door reads through the streaming reader (`verify_stream`, `verify_stream_async`), which 0.8.12 leaves unchanged, so no verdict of this crate moves.
+
 ## [0.6.3] - 2026-11-17
 
 - bsv-rs floor 0.8.11 (`bsv-rs = "0.8.11"` by caret, from `"0.8.0"`; the features unchanged: `auth`, `wallet`, `transaction`): a caller's lock can no longer hold this crate on a bsv-rs below 0.8.11. No source change in this crate, no wire change.
