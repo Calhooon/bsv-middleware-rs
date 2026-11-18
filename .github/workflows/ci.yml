@@ -177,3 +177,25 @@ jobs:
           done < <(git ls-files -z -- 'Cargo.lock' '*/Cargo.lock')
           [ "$found" -gt 0 ] || echo "no committed Cargo.lock"
           exit "$status"
+
+  # The secret shapes (tools/ci/secrets_scan.sh, the estate's scan with its key
+  # shapes): the tracked tree, every commit patch since the base and the diff's
+  # added lines. A job of its own: no toolchain, a few seconds beside the others.
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - name: Scan the tracked tree, commit patches and diff
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          base="${BASE_SHA:-}"
+          if [ "${REF_TYPE:-}" = tag ]; then
+            base=--tag
+          elif [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            base=--all
+          fi
+          tools/ci/secrets_scan.sh "$base"
